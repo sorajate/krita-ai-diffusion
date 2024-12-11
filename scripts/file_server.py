@@ -1,18 +1,18 @@
 """Simple HTTP server for testing the installation process.
-1) Run the docker.py script to download all required models.
+1) Run the download_models.py script to download all required models.
 2) Run this script to serve the model files on localhost.
 3) Set environment variable HOSTMAP=1 to replace all huggingface / civitai urls.
 """
 
-from aiohttp import web
-from itertools import chain
 import sys
+from aiohttp import web
 from pathlib import Path
+from urllib.parse import unquote as url_unquote
 
 sys.path.append(str(Path(__file__).parent.parent))
 from ai_diffusion import resources
 
-dir = Path(__file__).parent / "docker"
+dir = Path(__file__).parent / "downloads"
 
 
 def url_strip(url: str):
@@ -21,20 +21,35 @@ def url_strip(url: str):
     return without_query
 
 
-def get_path(m: resources.ModelResource):
-    if m.kind is resources.ResourceKind.ip_adapter:
-        return dir / "ip-adapter/" / m.filename
-    else:
-        return dir / m.folder / m.filename
+files = {
+    url_unquote(url_strip(url)): dir / filepath
+    for m in resources.all_models(include_deprecated=True)
+    for filepath, url in m.files.items()
+}
+
+urls = [
+    url_strip(url)
+    for m in resources.all_models(include_deprecated=True)
+    for _, url in m.files.items()
+]
 
 
-models = chain(
-    resources.required_models,
-    resources.optional_models,
-    resources.default_checkpoints,
-    resources.upscale_models,
-)
-files = {url_strip(m.url): get_path(m) for m in models}
+async def file_sender(file: Path):
+    with open(file, "rb") as f:
+        chunk = f.read(2**16)
+        while chunk:
+            yield chunk
+            chunk = f.read(2**16)
+
+
+def send_file(file: Path):
+    return web.Response(
+        headers={
+            "Content-disposition": f"attachment; filename={file.name}",
+            "Content-length": f"{file.stat().st_size}",
+        },
+        body=file_sender(file),
+    )
 
 
 async def handle(request: web.Request):
@@ -43,7 +58,7 @@ async def handle(request: web.Request):
     if file and file.exists():
         print(f"Sending {file}")
         try:
-            return web.FileResponse(file)
+            return send_file(file)
         except Exception as e:
             print(f"Failed to send {file}: {e}")
             return web.Response(status=500)
@@ -62,7 +77,7 @@ def run(port=51222, verbose=False):
             print(f"- {url} -> {path}")
 
     app = web.Application()
-    app.add_routes([web.get(url, handle) for url in files.keys()])
+    app.add_routes([web.get(url, handle) for url in urls])
     web.run_app(app, host="localhost", port=port)
 
 

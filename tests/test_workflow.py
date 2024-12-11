@@ -1,53 +1,102 @@
+import itertools
 import pytest
-from ai_diffusion import comfyworkflow, workflow
-from ai_diffusion.comfyworkflow import ComfyWorkflow
-from ai_diffusion.resources import ControlMode
-from ai_diffusion.image import Mask, Bounds, Extent, Image
-from ai_diffusion.client import Client, ClientEvent
-from ai_diffusion.style import SDVersion, Style
-from ai_diffusion.pose import Pose
-from ai_diffusion.workflow import LiveParams, Conditioning, Control
+import dotenv
+import json
+import os
+from datetime import datetime
 from pathlib import Path
+from typing import Any
+from PyQt5.QtCore import Qt
 
-test_dir = Path(__file__).parent
-image_dir = test_dir / "images"
-result_dir = test_dir / ".results"
-reference_dir = test_dir / "references"
-default_checkpoint = {
-    SDVersion.sd15: "realisticVisionV51_v51VAE.safetensors",
-    SDVersion.sdxl: "sdXL_v10VAEFix.safetensors",
-}
+from ai_diffusion import workflow
+from ai_diffusion.api import LoraInput, WorkflowKind, WorkflowInput, ControlInput, RegionInput
+from ai_diffusion.api import InpaintMode, FillMode, ConditioningInput, CustomWorkflowInput
+from ai_diffusion.api import SamplingInput, ImageInput
+from ai_diffusion.client import ClientModels, CheckpointInfo
+from ai_diffusion.comfy_client import ComfyClient
+from ai_diffusion.cloud_client import CloudClient
+from ai_diffusion.comfy_workflow import ComfyWorkflow, ComfyNode, Output
+from ai_diffusion.files import FileLibrary, FileCollection, File, FileSource
+from ai_diffusion.resources import ControlMode
+from ai_diffusion.settings import PerformanceSettings
+from ai_diffusion.image import Mask, Bounds, Extent, Image, ImageCollection
+from ai_diffusion.client import Client, ClientEvent
+from ai_diffusion.style import Arch, Style
+from ai_diffusion.pose import Pose
+from ai_diffusion.workflow import detect_inpaint
+from . import config
+from .config import root_dir, test_dir, image_dir, result_dir, reference_dir, default_checkpoint
+
+service_available = (root_dir / "service" / "web" / ".env.local").exists()
+client_params = ["local", "cloud"] if service_available else ["local"]
+files = FileLibrary(FileCollection(), FileCollection())
 
 
-@pytest.fixture(scope="session", autouse=True)
-def clear_results():
-    if result_dir.exists():
-        for file in result_dir.iterdir():
-            file.unlink()
-    result_dir.mkdir(exist_ok=True)
+async def connect_cloud():
+    dotenv.load_dotenv(root_dir / "service" / "web" / ".env.local")
+    url = os.environ["TEST_SERVICE_URL"]
+    token = os.environ.get("TEST_SERVICE_TOKEN", "")
+    if not token:
+        client = CloudClient(url)
+        sign_in = client.sign_in()
+        auth_url = await anext(sign_in)
+        print("\nSign-in required:", auth_url)
+        token = await anext(sign_in)
+        print("\nToken received:", token, "\n")
+    return await CloudClient.connect(url, token)
 
 
-@pytest.fixture()
-def comfy(qtapp):
-    return qtapp.run(Client.connect())
+@pytest.fixture(params=client_params)
+def client(pytestconfig, request, qtapp):
+    if pytestconfig.getoption("--ci"):
+        pytest.skip("Diffusion is disabled on CI")
+
+    if request.param == "local":
+        client = qtapp.run(ComfyClient.connect())
+    else:
+        client = qtapp.run(connect_cloud())
+    files.loras.update([File.remote(m) for m in client.models.loras], FileSource.remote)
+
+    yield client
+
+    qtapp.run(client.disconnect())
 
 
-def default_style(comfy, sd_ver=SDVersion.sd15):
-    version_checkpoints = [c for c in comfy.checkpoints if sd_ver.matches(c)]
+default_seed = 1234
+default_perf = PerformanceSettings(batch_size=1)
+
+
+def default_style(client: Client, sd_ver=Arch.sd15):
+    version_checkpoints = [c for c in client.models.checkpoints if sd_ver.matches(c)]
     checkpoint = default_checkpoint[sd_ver]
 
     style = Style(Path("default.json"))
-    style.sd_checkpoint = (
-        checkpoint if checkpoint in version_checkpoints else version_checkpoints[0]
-    )
+    style.checkpoints = [checkpoint] + version_checkpoints
     return style
 
 
-async def receive_images(comfy: Client, workflow: ComfyWorkflow):
+def create(kind: WorkflowKind, client: Client, **kwargs):
+    kwargs.setdefault("cond", ConditioningInput(""))
+    kwargs.setdefault("style", default_style(client))
+    kwargs.setdefault("seed", default_seed)
+    kwargs.setdefault("perf", default_perf)
+    kwargs.setdefault("files", files)
+    return workflow.prepare(kind, models=client.models, **kwargs)
+
+
+counter = 0
+
+
+async def receive_images(client: Client, work: WorkflowInput):
+    global counter
+
+    counter += 1
+
     job_id = None
-    async for msg in comfy.listen():
+    messages = client.listen()
+    async for msg in messages:
         if not job_id:
-            job_id = await comfy.enqueue(workflow)
+            job_id = await client.enqueue(work)
         if msg.event is ClientEvent.finished and msg.job_id == job_id:
             assert msg.images is not None
             return msg.images
@@ -56,345 +105,443 @@ async def receive_images(comfy: Client, workflow: ComfyWorkflow):
     assert False, "Connection closed without receiving images"
 
 
-async def run_and_save(comfy, workflow: ComfyWorkflow, filename: str):
-    results = await receive_images(comfy, workflow)
+def run_and_save(
+    qtapp,
+    client: Client,
+    work: WorkflowInput,
+    filename: str,
+    composition_image: Image | None = None,
+    composition_mask: Mask | None = None,
+    output_dir: Path = result_dir,
+):
+    dump_workflow(work, filename, client)
+
+    async def runner():
+        return await receive_images(client, work)
+
+    results: ImageCollection = qtapp.run(runner())
     assert len(results) == 1
-    results[0].save(result_dir / filename)
+    client_name = "local" if isinstance(client, ComfyClient) else "cloud"
+    if composition_image and composition_mask:
+        composition_image.draw_image(results[0], composition_mask.bounds.offset)
+        composition_image.save(output_dir / f"{filename}_{client_name}.png")
+    else:
+        results[0].save(output_dir / f"{filename}_{client_name}.png")
     return results[0]
 
 
-@pytest.mark.parametrize(
-    "extent, min_size, max_batches, expected",
-    [
-        (Extent(512, 512), 512, 4, 4),
-        (Extent(512, 512), 512, 6, 6),
-        (Extent(1024, 512), 512, 8, 4),
-        (Extent(1024, 1024), 512, 8, 2),
-        (Extent(2048, 1024), 512, 6, 1),
-        (Extent(256, 256), 512, 4, 4),
-    ],
-)
-def test_compute_batch_size(extent, min_size, max_batches, expected):
-    assert workflow.compute_batch_size(extent, min_size, max_batches) == expected
+def dump_workflow(work: WorkflowInput, filename: str, client: Client):
+    flow = workflow.create(work, client.models)
+    flow.dump((result_dir / "workflows" / filename).with_suffix(".json"))
 
 
-@pytest.mark.parametrize(
-    "area,expected_extent,expected_crop",
-    [
-        (Bounds(0, 0, 128, 512), Extent(384, 512), (0, 256)),
-        (Bounds(384, 0, 128, 512), Extent(384, 512), (383, 256)),
-        (Bounds(0, 0, 512, 128), Extent(512, 384), (256, 0)),
-        (Bounds(0, 384, 512, 128), Extent(512, 384), (256, 383)),
-        (Bounds(0, 0, 512, 512), None, None),
-        (Bounds(0, 0, 256, 256), None, None),
-        (Bounds(256, 256, 256, 256), None, None),
-    ],
-    ids=["left", "right", "top", "bottom", "full", "small", "offset"],
-)
-def test_inpaint_context(area, expected_extent, expected_crop: tuple[int, int] | None):
-    image = Image.load(image_dir / "outpaint_context.png")
-    default = comfyworkflow.Output(0, 0)
-    result = workflow.create_inpaint_context(image, area, default)
-    if expected_crop:
-        assert isinstance(result, Image)
-        assert result.extent == expected_extent
-        assert result.pixel(*expected_crop) == (255, 255, 255, 255)
-    else:
-        assert result is default
+def automatic_inpaint(
+    image_extent: Extent,
+    bounds: Bounds,
+    sd_ver: Arch = Arch.sd15,
+    prompt: str = "",
+    control: list[ControlInput] = [],
+):
+    mode = workflow.detect_inpaint_mode(image_extent, bounds)
+    return detect_inpaint(mode, bounds, sd_ver, prompt, control, strength=1.0)
 
 
-@pytest.mark.parametrize(
-    "input,expected_initial,expected_expanded,expected_scale",
-    [
-        (Extent(1536, 600), Extent(1008, 392), Extent(1536, 600), 0.6532),
-        (Extent(400, 1024), Extent(392, 1008), Extent(400, 1024), 0.9798),
-        (Extent(777, 999), Extent(560, 712), Extent(784, 1000), 0.7117),
-    ],
-)
-def test_prepare_highres(input, expected_initial, expected_expanded, expected_scale):
-    image = Image.create(input)
-    mask = Mask.rectangle(Bounds(0, 0, input.width, input.height))
-    extent, image, mask_image, _ = workflow.prepare_masked(image, mask, SDVersion.sd15)
-    assert (
-        extent.requires_upscale
-        and image.extent == expected_initial
-        and mask_image.extent == expected_initial
-        and extent.initial == expected_initial
-        and extent.expanded == expected_expanded
-        and extent.target == input
-        and extent.scale == pytest.approx(expected_scale, abs=1e-3)
+def test_inpaint_params():
+    bounds = Bounds(0, 0, 100, 100)
+
+    a = detect_inpaint(InpaintMode.fill, bounds, Arch.sd15, "", [], 1.0)
+    assert a.fill is FillMode.blur and a.use_inpaint_model == True and a.use_reference == True
+
+    b = detect_inpaint(InpaintMode.add_object, bounds, Arch.sd15, "", [], 1.0)
+    assert b.fill is FillMode.neutral and b.use_condition_mask == False
+
+    c = detect_inpaint(InpaintMode.replace_background, bounds, Arch.sdxl, "", [], 1.0)
+    assert c.fill is FillMode.replace and c.use_inpaint_model == True and c.use_reference == False
+
+    d = detect_inpaint(InpaintMode.add_object, bounds, Arch.sd15, "prompt", [], 1.0)
+    assert d.use_condition_mask == True
+
+    control = [ControlInput(ControlMode.line_art, Image.create(Extent(4, 4)))]
+    e = detect_inpaint(InpaintMode.add_object, bounds, Arch.sd15, "prompt", control, 1.0)
+    assert e.use_condition_mask == False
+
+
+def test_prepare_lora():
+    models = ClientModels()
+    models.checkpoints = {"CP": CheckpointInfo("CP", Arch.sd15)}
+    models.loras = [
+        "PINK_UNICORNS.safetensors",
+        "MOTHER_OF_PEARL.safetensors",
+        "x/FRACTAL.safetensors",
+    ]
+
+    files = FileLibrary(FileCollection(), FileCollection())
+    fractal = files.loras.add(File.remote("x/FRACTAL.safetensors"))
+    files.loras.set_meta(fractal, "lora_strength", 0.55)
+
+    mop = files.loras.add(File.remote("MOTHER_OF_PEARL.safetensors"))
+    files.loras.set_meta(mop, "lora_triggers", "crab")
+    files.loras.update([File.remote(m) for m in models.loras], FileSource.remote)
+
+    style = Style(Path("default.json"))
+    style.checkpoints = ["CP"]
+    style.loras.append(dict(name="MOTHER_OF_PEARL.safetensors", strength=0.33))
+
+    job = workflow.prepare(
+        WorkflowKind.generate,
+        canvas=Extent(512, 512),
+        cond=ConditioningInput("test <lora:PINK_UNICORNS:0.77> baloon <lora:x/FRACTAL> space"),
+        style=style,
+        seed=29,
+        models=models,
+        files=files,
+        perf=default_perf,
     )
-
-
-@pytest.mark.parametrize(
-    "input,expected",
-    [
-        (Extent(256, 256), Extent(512, 512)),
-        (Extent(128, 450), Extent(280, 960)),
-        (Extent(256, 333), Extent(456, 584)),  # multiple of 8
-    ],
-)
-def test_prepare_lowres(input, expected):
-    image = Image.create(input)
-    mask = Mask.rectangle(Bounds(0, 0, input.width, input.height))
-    extent, image, mask_image, _ = workflow.prepare_masked(image, mask, SDVersion.sd15)
+    assert job.conditioning and job.conditioning.positive == "test  baloon  space crab"
     assert (
-        extent.requires_downscale
-        and image.extent == input
-        and mask_image.extent == input
-        and extent.target == input
-        and extent.initial == expected
-        and extent.expanded == input.multiple_of(8)
-        and extent.scale > 1
+        job.models
+        and LoraInput("PINK_UNICORNS.safetensors", 0.77) in job.models.loras
+        and LoraInput("MOTHER_OF_PEARL.safetensors", 0.33) in job.models.loras
+        and LoraInput("x/FRACTAL.safetensors", 0.55) in job.models.loras
     )
-
-
-@pytest.mark.parametrize(
-    "input",
-    [Extent(512, 512), Extent(128, 600), Extent(768, 240)],
-)
-def test_prepare_passthrough(input):
-    image = Image.create(input)
-    mask = Mask.rectangle(Bounds(0, 0, input.width, input.height))
-    extent, image, mask_image, _ = workflow.prepare_masked(image, mask, SDVersion.sd15)
-    assert (
-        image == image
-        and mask_image.extent == input
-        and extent.initial == input
-        and extent.target == input
-        and extent.expanded == input
-        and extent.scale == 1
-    )
-
-
-@pytest.mark.parametrize(
-    "input,expected", [(Extent(512, 513), Extent(512, 520)), (Extent(300, 1024), Extent(304, 1024))]
-)
-def test_prepare_multiple8(input, expected):
-    result, _ = workflow.prepare_extent(input, SDVersion.sd15)
-    assert (
-        result.is_incompatible
-        and result.initial == expected
-        and result.target == input
-        and result.expanded == input.multiple_of(8)
-    )
-
-
-@pytest.mark.parametrize("sdver", [SDVersion.sd15, SDVersion.sdxl])
-def test_prepare_extent(sdver: SDVersion):
-    input = Extent(1024, 1536)
-    result, _ = workflow.prepare_extent(input, sdver)
-    expected = Extent(512, 768) if sdver == SDVersion.sd15 else Extent(840, 1256)
-    assert result.initial == expected and result.target == input and result.scale < 1
-
-
-def test_prepare_no_mask():
-    image = Image.create(Extent(256, 256))
-    extent, result, _ = workflow.prepare_image(image, SDVersion.sd15)
-    assert (
-        result == image
-        and extent.initial == Extent(512, 512)
-        and extent.target == image.extent
-        and extent.scale == 2
-    )
-
-
-def test_prepare_no_downscale():
-    image = Image.create(Extent(1536, 1536))
-    extent, result, _ = workflow.prepare_image(image, SDVersion.sd15, downscale=False)
-    assert (
-        extent.requires_upscale is False
-        and result == image
-        and extent.initial == image.extent
-        and extent.target == image.extent
-        and extent.scale == 1
-    )
-
-
-def test_merge_prompt():
-    assert workflow.merge_prompt("a", "b") == "a, b"
-    assert workflow.merge_prompt("", "b") == "b"
-    assert workflow.merge_prompt("a", "") == "a"
-    assert workflow.merge_prompt("", "") == ""
-    assert workflow.merge_prompt("a", "b {prompt} c") == "b a c"
-    assert workflow.merge_prompt("", "b {prompt} c") == "b  c"
 
 
 @pytest.mark.parametrize("extent", [Extent(256, 256), Extent(800, 800), Extent(512, 1024)])
-def test_generate(qtapp, comfy, temp_settings, extent):
-    temp_settings.batch_size = 1
-    prompt = Conditioning("ship")
+def test_generate(qtapp, client, extent: Extent):
+    prompt = ConditioningInput("ship")
+    job = create(WorkflowKind.generate, client, canvas=extent, cond=prompt)
+    result = run_and_save(qtapp, client, job, f"test_generate_{extent.width}x{extent.height}")
+    assert result.extent == extent
+
+
+def test_inpaint(qtapp, client):
+    image = Image.load(image_dir / "beach_768x512.webp")
+    mask = Mask.rectangle(Bounds(40, 120, 320, 200), feather=10)
+    cond = ConditioningInput("beach, the sea, cliffs, palm trees")
+    job = create(
+        WorkflowKind.inpaint,
+        client,
+        canvas=image,
+        mask=mask,
+        style=default_style(client, Arch.sd15),
+        cond=cond,
+        perf=PerformanceSettings(batch_size=3),  # max 3 images@512x512 -> 2 images@768x512
+        inpaint=detect_inpaint(InpaintMode.fill, mask.bounds, Arch.sd15, cond.positive, [], 1.0),
+    )
 
     async def main():
-        job = workflow.generate(comfy, default_style(comfy), extent, prompt)
-        results = await receive_images(comfy, job)
-        results[0].save(result_dir / f"test_generate_{extent.width}x{extent.height}.png")
-        assert results[0].extent == extent
-
-    qtapp.run(main())
-
-
-def test_inpaint(qtapp, comfy, temp_settings):
-    temp_settings.batch_size = 3  # max 3 images@512x512 -> 2 images@768x512
-    image = Image.load(image_dir / "beach_768x512.png")
-    mask = Mask.rectangle(Bounds(50, 100, 320, 200), feather=10)
-    prompt = Conditioning("ship")
-    job = workflow.inpaint(comfy, default_style(comfy), image, mask, prompt)
-
-    async def main():
-        results = await receive_images(comfy, job)
+        results = await receive_images(client, job)
         assert len(results) == 2
+        client_name = "local" if isinstance(client, ComfyClient) else "cloud"
         for i, result in enumerate(results):
-            result.save(result_dir / f"test_inpaint_{i}.png")
+            image.draw_image(result, mask.bounds.offset)
+            image.save(result_dir / f"test_inpaint_{i}_{client_name}.png")
             assert result.extent == Extent(320, 200)
 
     qtapp.run(main())
 
 
-@pytest.mark.parametrize("sdver", [SDVersion.sd15, SDVersion.sdxl])
-def test_inpaint_upscale(qtapp, comfy, temp_settings, sdver):
-    temp_settings.batch_size = 3  # 2 images for 1.5, 1 image for XL
-    image = Image.load(image_dir / "beach_1536x1024.png")
-    mask = Mask.rectangle(Bounds(600, 200, 768, 512), feather=10)
-    prompt = Conditioning("ship")
-    job = workflow.inpaint(comfy, default_style(comfy, sdver), image, mask, prompt)
+@pytest.mark.parametrize("sdver", [Arch.sd15, Arch.sdxl])
+def test_inpaint_upscale(qtapp, client, sdver):
+    image = Image.load(image_dir / "beach_1536x1024.webp")
+    mask = Mask.rectangle(Bounds(300, 200, 768, 512), feather=20)
+    prompt = ConditioningInput("ship")
+    job = create(
+        WorkflowKind.inpaint,
+        client,
+        canvas=image,
+        mask=mask,
+        style=default_style(client, sdver),
+        cond=prompt,
+        perf=PerformanceSettings(batch_size=3),  # 2 images for 1.5, 1 image for XL
+        inpaint=detect_inpaint(
+            InpaintMode.add_object, mask.bounds, sdver, prompt.positive, [], 1.0
+        ),
+    )
 
     async def main():
-        results = await receive_images(comfy, job)
-        assert len(results) == 2 if sdver == SDVersion.sd15 else 1
+        dump_workflow(job, f"test_inpaint_upscale_{sdver.name}.json", client)
+        results = await receive_images(client, job)
+        assert len(results) == 2 if sdver == Arch.sd15 else 1
+        client_name = "local" if isinstance(client, ComfyClient) else "cloud"
         for i, result in enumerate(results):
-            result.save(result_dir / f"test_inpaint_upscale_{sdver.name}_{i}.png")
+            image.draw_image(result, mask.bounds.offset)
+            image.save(result_dir / f"test_inpaint_upscale_{sdver.name}_{i}_{client_name}.png")
             assert result.extent == mask.bounds.extent
 
     qtapp.run(main())
 
 
-def test_inpaint_odd_resolution(qtapp, comfy, temp_settings):
-    temp_settings.batch_size = 1
-    image = Image.load(image_dir / "beach_768x512.png")
+def test_inpaint_odd_resolution(qtapp, client):
+    image = Image.load(image_dir / "beach_768x512.webp")
     image = Image.scale(image, Extent(612, 513))
     mask = Mask.rectangle(Bounds(0, 0, 200, 513))
-    prompt = Conditioning()
+    job = create(
+        WorkflowKind.inpaint,
+        client,
+        canvas=image,
+        mask=mask,
+        inpaint=automatic_inpaint(image.extent, mask.bounds),
+    )
+    result = run_and_save(qtapp, client, job, "test_inpaint_odd_resolution", image, mask)
+    assert result.extent == mask.bounds.extent
 
-    async def main():
-        job = workflow.inpaint(comfy, default_style(comfy), image, mask, prompt)
-        results = await receive_images(comfy, job)
-        results[0].save(result_dir / "test_inpaint_odd_resolution.png")
-        assert results[0].extent == mask.bounds.extent
 
-    qtapp.run(main())
-
-
-def test_inpaint_area_conditioning(qtapp, comfy, temp_settings):
-    temp_settings.batch_size = 1
-    image = Image.load(image_dir / "lake_1536x1024.png")
+def test_inpaint_area_conditioning(qtapp, client):
+    image = Image.load(image_dir / "lake_1536x1024.webp")
     mask = Mask.load(image_dir / "lake_1536x1024_mask_bottom_right.png")
-    prompt = Conditioning("crocodile")
-    job = workflow.inpaint(comfy, default_style(comfy), image, mask, prompt)
-
-    async def main():
-        await run_and_save(comfy, job, "test_inpaint_area_conditioning.png")
-
-    qtapp.run(main())
-
-
-@pytest.mark.parametrize("sdver", [SDVersion.sd15, SDVersion.sdxl])
-def test_refine(qtapp, comfy, sdver, temp_settings):
-    temp_settings.batch_size = 1
-    image = Image.load(image_dir / "beach_768x512.png")
-    prompt = Conditioning("painting in the style of Vincent van Gogh")
-    strength = {SDVersion.sd15: 0.5, SDVersion.sdxl: 0.65}[sdver]
-
-    async def main():
-        job = workflow.refine(comfy, default_style(comfy, sdver), image, prompt, strength)
-        results = await receive_images(comfy, job)
-        results[0].save(result_dir / f"test_refine_{sdver.name}.png")
-        assert results[0].extent == image.extent
-
-    qtapp.run(main())
+    prompt = ConditioningInput("(crocodile)")
+    job = create(
+        WorkflowKind.inpaint,
+        client,
+        canvas=image,
+        mask=mask,
+        cond=prompt,
+        inpaint=detect_inpaint(
+            InpaintMode.add_object, mask.bounds, Arch.sd15, prompt.positive, [], 1.0
+        ),
+    )
+    run_and_save(qtapp, client, job, "test_inpaint_area_conditioning", image, mask)
 
 
-def test_refine_region(qtapp, comfy, temp_settings):
-    temp_settings.batch_size = 1
-    image = Image.load(image_dir / "lake_region.png")
+def test_inpaint_remove_object(qtapp, client):
+    image = Image.load(image_dir / "owls_inpaint.webp")
+    mask = Mask.load(image_dir / "owls_mask_remove.webp")
+    job = create(
+        WorkflowKind.inpaint,
+        client,
+        canvas=image,
+        mask=mask,
+        cond=ConditioningInput("tree branch"),
+        inpaint=detect_inpaint(InpaintMode.remove_object, mask.bounds, Arch.sd15, "tree", [], 1.0),
+    )
+    run_and_save(qtapp, client, job, "test_inpaint_remove_object", image, mask)
+
+
+@pytest.mark.parametrize("setup", ["sd15", "sdxl"])
+def test_refine(qtapp, client, setup):
+    sdver, extent, strength = {
+        "sd15": (Arch.sd15, Extent(768, 508), 0.5),
+        "sdxl": (Arch.sdxl, Extent(1111, 741), 0.65),
+    }[setup]
+    image = Image.load(image_dir / "beach_1536x1024.webp")
+    image = Image.scale(image, extent)
+    job = create(
+        WorkflowKind.refine,
+        client,
+        canvas=image,
+        style=default_style(client, sdver),
+        cond=ConditioningInput("painting in the style of Vincent van Gogh"),
+        strength=strength,
+        perf=PerformanceSettings(batch_size=1, max_pixel_count=2),
+    )
+    result = run_and_save(qtapp, client, job, f"test_refine_{setup}")
+    assert result.extent == extent
+
+
+@pytest.mark.parametrize("setup", ["sd15_0.4", "sd15_0.6", "sdxl_0.7"])
+def test_refine_region(qtapp, client, setup):
+    sdver, strength = {
+        "sd15_0.4": (Arch.sd15, 0.4),
+        "sd15_0.6": (Arch.sd15, 0.6),
+        "sdxl_0.7": (Arch.sdxl, 0.7),
+    }[setup]
+    image = Image.load(image_dir / "lake_region.webp")
     mask = Mask.load(image_dir / "lake_region_mask.png")
-    prompt = Conditioning("waterfall")
+    prompt = ConditioningInput("waterfall")
+    params = detect_inpaint(InpaintMode.fill, mask.bounds, Arch.sd15, prompt.positive, [], strength)
+    job = create(
+        WorkflowKind.refine_region,
+        client,
+        canvas=image,
+        mask=mask,
+        style=default_style(client, sdver),
+        cond=prompt,
+        strength=strength,
+        inpaint=params,
+    )
+    result = run_and_save(qtapp, client, job, f"test_refine_region_{setup}", image, mask)
+    assert result.extent == mask.bounds.extent
 
-    async def main():
-        job = workflow.refine_region(comfy, default_style(comfy), image, mask, prompt, 0.6)
-        results = await receive_images(comfy, job)
-        results[0].save(result_dir / "test_refine_region.png")
-        assert results[0].extent == mask.bounds.extent
 
-    qtapp.run(main())
+def test_differential_diffusion(qtapp, client):
+    image = Image.scale(Image.load(image_dir / "beach_1536x1024.webp"), Extent(768, 512))
+    mask = Mask.load(image_dir / "differential_diffusion_mask.webp")
+    prompt = ConditioningInput("barren plain, volcanic wasteland, burned trees")
+    params = detect_inpaint(InpaintMode.fill, mask.bounds, Arch.sd15, prompt.positive, [], 0.9)
+    job = create(
+        WorkflowKind.refine_region,
+        client,
+        canvas=image,
+        mask=mask,
+        style=default_style(client, Arch.sd15),
+        cond=prompt,
+        strength=0.9,
+        inpaint=params,
+    )
+    run_and_save(qtapp, client, job, "test_differential_diffusion", image, mask)
+
+
+def region_prompt():
+    root_text = "a collection of objects on a wooden workbench, evening light, dust motes"
+    prompt = ConditioningInput(root_text)
+    prompt.regions = [
+        RegionInput(
+            Mask.load(image_dir / "region_mask_bg.png").to_image(),
+            Bounds(0, 0, 1024, 1024),
+            "a workbench made of wood, sturdy and well-used",
+        ),
+        RegionInput(
+            Mask.load(image_dir / "region_mask_1.png").to_image(),
+            Bounds(320, 220, 350, 580),
+            "a chemical bottle, something pink oozing out, flask",
+        ),
+        RegionInput(
+            Mask.load(image_dir / "region_mask_2.png").to_image(),
+            Bounds(600, 150, 424, 600),
+            "a miniature model of a sailing boat made out of light wood, with red sails",
+        ),
+        RegionInput(
+            Mask.load(image_dir / "region_mask_3.png").to_image(),
+            Bounds(0, 250, 355, 700),
+            "a gramophone with a large horn, made of brass",
+        ),
+    ]
+    for region in prompt.regions:
+        region.positive += " " + root_text
+    return prompt
+
+
+@pytest.mark.parametrize("sdver", [Arch.sd15, Arch.sdxl])
+def test_regions(qtapp, client, sdver: Arch):
+    style = default_style(client, sdver)
+    job = create(
+        WorkflowKind.generate, client, canvas=Extent(1024, 1024), cond=region_prompt(), style=style
+    )
+    run_and_save(qtapp, client, job, f"test_regions_{sdver.name}")
+
+
+@pytest.mark.parametrize("kind", [WorkflowKind.inpaint, WorkflowKind.refine_region])
+def test_regions_inpaint(qtapp, client, kind: WorkflowKind):
+    image = Image.load(image_dir / "regions_inpaint.webp")
+    mask = Mask.load(image_dir / "region_mask_inpaint.png")
+    prompt = region_prompt()
+    prompt.regions = prompt.regions[:2] + prompt.regions[3:]
+    prompt.regions[0].mask = Mask.load(image_dir / "region_mask_bg2.png").to_image()
+    params = detect_inpaint(InpaintMode.fill, mask.bounds, Arch.sd15, prompt.positive, [], 1.0)
+    strength = 0.7 if kind is WorkflowKind.refine_region else 1.0
+    job = create(
+        kind, client, canvas=image, mask=mask, cond=prompt, inpaint=params, strength=strength
+    )
+    run_and_save(qtapp, client, job, f"test_regions_{kind.name}", image, mask)
+
+
+def test_regions_upscale(qtapp, client: Client):
+    job = create(
+        WorkflowKind.upscale_tiled,
+        client,
+        canvas=Image.load(image_dir / "regions_base.webp"),
+        cond=region_prompt(),
+        strength=0.5,
+        upscale_model=client.models.default_upscaler,
+        upscale_factor=2,
+    )
+    run_and_save(qtapp, client, job, f"test_regions_upscale")
+
+
+def test_regions_ip_adapter(qtapp, client: Client):
+    cat = Image.load(image_dir / "cat.webp")
+    flowers = Image.load(image_dir / "flowers.webp")
+    prompt = region_prompt()
+    prompt.regions[2].positive = ""
+    prompt.regions[2].control.append(ControlInput(ControlMode.reference, flowers))
+    prompt.regions[3].positive = ""
+    prompt.regions[3].control.append(ControlInput(ControlMode.reference, cat))
+    job = create(WorkflowKind.generate, client, canvas=Extent(1024, 1024), cond=prompt)
+    run_and_save(qtapp, client, job, f"test_regions_ip_adapter")
 
 
 @pytest.mark.parametrize(
     "op", ["generate", "inpaint", "refine", "refine_region", "inpaint_upscale"]
 )
-def test_control_scribble(qtapp, comfy, temp_settings, op):
-    temp_settings.batch_size = 1
-    style = default_style(comfy)
-    scribble_image = Image.load(image_dir / "owls_scribble.png")
-    inpaint_image = Image.load(image_dir / "owls_inpaint.png")
+def test_control_scribble(qtapp, client, op):
+    scribble_image = Image.load(image_dir / "owls_scribble.webp")
+    inpaint_image = Image.load(image_dir / "owls_inpaint.webp")
     mask = Mask.load(image_dir / "owls_mask.png")
     mask.bounds = Bounds(256, 0, 256, 512)
-    control = Conditioning("owls", "", [Control(ControlMode.scribble, scribble_image)])
+    control = [ControlInput(ControlMode.scribble, scribble_image)]
+    prompt = ConditioningInput("owls", control=control)
 
+    args: dict[str, Any]
     if op == "generate":
-        job = workflow.generate(comfy, style, Extent(512, 512), control)
+        args = dict(kind=WorkflowKind.generate, canvas=Extent(512, 512))
     elif op == "inpaint":
-        control.area = Bounds(322, 108, 144, 300)
-        job = workflow.inpaint(comfy, style, inpaint_image, mask, control)
+        params = automatic_inpaint(inpaint_image.extent, mask.bounds)
+        args = dict(kind=WorkflowKind.inpaint, canvas=inpaint_image, mask=mask, inpaint=params)
     elif op == "refine":
-        job = workflow.refine(comfy, style, inpaint_image, control, 0.7)
+        args = dict(kind=WorkflowKind.refine, canvas=inpaint_image, strength=0.7)
     elif op == "refine_region":
-        cropped_image = Image.crop(inpaint_image, mask.bounds)
-        job = workflow.refine_region(comfy, style, cropped_image, mask, control, 0.7)
+        kind = WorkflowKind.refine_region
+        crop_image = Image.crop(inpaint_image, mask.bounds)
+        control[0].image = Image.crop(scribble_image, mask.bounds)
+        crop_mask = Mask(Bounds(0, 0, 256, 512), mask.image)
+        params = params = automatic_inpaint(crop_image.extent, crop_mask.bounds)
+        args = dict(kind=kind, canvas=crop_image, mask=crop_mask, strength=0.7, inpaint=params)
     else:  # op == "inpaint_upscale":
-        control.control[0].image = Image.scale(scribble_image, Extent(1024, 1024))
-        control.area = Bounds(322 * 2, 108 * 2, 144 * 2, 300 * 2)
-        upscaled_image = Image.scale(inpaint_image, Extent(1024, 1024))
-        upscaled_mask = Mask(
-            Bounds(512, 0, 512, 1024), Image.scale(Image(mask.image), Extent(512, 1024))._qimage
-        )
-        job = workflow.inpaint(comfy, style, upscaled_image, upscaled_mask, control)
+        control[0].image = Image.scale(scribble_image, Extent(1024, 1024))
+        inpaint_image = Image.scale(inpaint_image, Extent(1024, 1024))
+        scaled_mask = Image.scale(Image(mask.image), Extent(512, 1024))
+        mask = Mask(Bounds(512, 0, 512, 1024), scaled_mask._qimage)
+        params = detect_inpaint(InpaintMode.fill, mask.bounds, Arch.sd15, "owls", control, 1.0)
+        args = dict(kind=WorkflowKind.inpaint, canvas=inpaint_image, mask=mask, inpaint=params)
 
-    async def main():
-        await run_and_save(comfy, job, f"test_control_scribble_{op}.png")
+    job = create(client=client, cond=prompt, **args)
+    if op in ["inpaint", "refine_region", "inpaint_upscale"]:
+        run_and_save(qtapp, client, job, f"test_control_scribble_{op}", inpaint_image, mask)
+    else:
+        run_and_save(qtapp, client, job, f"test_control_scribble_{op}")
 
-    qtapp.run(main())
+
+def test_control_canny_downscale(qtapp, client):
+    canny_image = Image.load(image_dir / "shrine_canny.webp")
+    control = [ControlInput(ControlMode.canny_edge, canny_image, 1.0)]
+    prompt = ConditioningInput("shrine", control=control)
+    job = create(WorkflowKind.generate, client, canvas=Extent(999, 999), cond=prompt)
+    run_and_save(qtapp, client, job, "test_control_canny_downscale")
 
 
 @pytest.mark.parametrize("mode", [m for m in ControlMode if m.has_preprocessor])
-def test_create_control_image(qtapp, comfy, mode):
-    image_name = f"test_create_control_image_{mode.name}.png"
+def test_create_control_image(qtapp, client: Client, mode):
+    skip_cloud_modes = [ControlMode.normal, ControlMode.segmentation, ControlMode.hands]
+    if isinstance(client, CloudClient) and mode in skip_cloud_modes:
+        pytest.skip("Control image preproccessor not available")
+
+    image_name = f"test_create_control_image_{mode.name}"
     image = Image.load(image_dir / "adobe_stock.jpg")
-    job = workflow.create_control_image(image, mode)
+    job = workflow.prepare_create_control_image(image, mode, default_perf)
 
-    async def main():
-        result = await run_and_save(comfy, job, image_name)
+    result = run_and_save(qtapp, client, job, image_name)
+    if isinstance(client, ComfyClient):
         reference = Image.load(reference_dir / image_name)
-        assert Image.compare(result, reference) < 0.002
+        threshold = 0.015 if mode is ControlMode.pose else 0.003
+        assert Image.compare(result, reference) < threshold
+        # cloud results are a bit different, maybe due to compression of input?
 
-    qtapp.run(main())
 
-
-def test_create_open_pose_vector(qtapp, comfy):
+def test_create_open_pose_vector(qtapp, client: Client):
     image_name = f"test_create_open_pose_vector.svg"
     image = Image.load(image_dir / "adobe_stock.jpg")
-    job = workflow.create_control_image(image, ControlMode.pose)
+    job = workflow.prepare_create_control_image(image, ControlMode.pose, default_perf)
 
     async def main():
         job_id = None
-        async for msg in comfy.listen():
+        async for msg in client.listen():
             if not job_id:
-                job_id = await comfy.enqueue(job)
+                job_id = await client.enqueue(job)
             if msg.event is ClientEvent.finished and msg.job_id == job_id:
+                assert isinstance(msg.result, (dict, list))
                 result = Pose.from_open_pose_json(msg.result).to_svg()
                 (result_dir / image_name).write_text(result)
-                reference = (reference_dir / image_name).read_text()
-                assert result == reference
                 return
             if msg.event is ClientEvent.error and msg.job_id == job_id:
                 raise Exception(msg.error)
@@ -403,95 +550,353 @@ def test_create_open_pose_vector(qtapp, comfy):
     qtapp.run(main())
 
 
-@pytest.mark.parametrize("sdver", [SDVersion.sd15, SDVersion.sdxl])
-def test_ip_adapter(qtapp, comfy, temp_settings, sdver):
-    temp_settings.batch_size = 1
-    image = Image.load(image_dir / "cat.png")
-    control = Conditioning(
-        "cat on a rooftop in paris", "", [Control(ControlMode.image, image, 0.6)]
+@pytest.mark.parametrize("setup", ["no_mask", "right_hand", "left_hand"])
+def test_create_hand_refiner_image(qtapp, client: Client, setup):
+    if isinstance(client, CloudClient):
+        pytest.skip("Hand refiner is not available in the cloud")
+    image_name = f"test_create_hand_refiner_image_{setup}"
+    image = Image.load(image_dir / "character.webp")
+    bounds = {
+        "no_mask": None,
+        "right_hand": Bounds(102, 398, 264, 240),
+        "left_hand": Bounds(541, 642, 232, 248),
+    }[setup]
+    job = workflow.prepare_create_control_image(
+        image, ControlMode.hands, default_perf, bounds, default_seed
     )
-    extent = Extent(512, 512) if sdver == SDVersion.sd15 else Extent(1024, 1024)
-    job = workflow.generate(comfy, default_style(comfy, sdver), extent, control)
-
-    async def main():
-        await run_and_save(comfy, job, f"test_ip_adapter_{sdver.name}.png")
-
-    qtapp.run(main())
+    result = run_and_save(qtapp, client, job, image_name)
+    reference = Image.load(reference_dir / image_name)
+    assert Image.compare(result, reference) < 0.002
 
 
-def test_ip_adapter_region(qtapp, comfy, temp_settings):
-    temp_settings.batch_size = 1
-    image = Image.load(image_dir / "flowers.png")
+@pytest.mark.parametrize("sdver", [Arch.sd15, Arch.sdxl])
+def test_ip_adapter(qtapp, client, sdver):
+    image = Image.load(image_dir / "cat.webp")
+    prompt = ConditioningInput("cat on a rooftop in paris")
+    prompt.control = [ControlInput(ControlMode.reference, image, 0.6)]
+    extent = Extent(512, 512) if sdver == Arch.sd15 else Extent(1024, 1024)
+    style = default_style(client, sdver)
+    job = create(WorkflowKind.generate, client, style=style, canvas=extent, cond=prompt)
+    run_and_save(qtapp, client, job, f"test_ip_adapter_{sdver.name}")
+
+
+def test_ip_adapter_region(qtapp, client):
+    image = Image.load(image_dir / "flowers.webp")
     mask = Mask.load(image_dir / "flowers_mask.png")
-    control_img = Image.load(image_dir / "pegonia.png")
-    control = Conditioning("potted flowers", "", [Control(ControlMode.image, control_img, 0.7)])
-    job = workflow.refine_region(comfy, default_style(comfy), image, mask, control, 0.6)
-
-    async def main():
-        await run_and_save(comfy, job, "test_ip_adapter_region.png")
-
-    qtapp.run(main())
-
-
-def test_ip_adapter_batch(qtapp, comfy, temp_settings):
-    temp_settings.batch_size = 1
-    image1 = Image.load(image_dir / "cat.png")
-    image2 = Image.load(image_dir / "pegonia.png")
-    control = Conditioning(
-        "", "", [Control(ControlMode.image, image1, 1.0), Control(ControlMode.image, image2, 1.0)]
+    control_img = Image.load(image_dir / "pegonia.webp")
+    prompt = ConditioningInput("potted flowers")
+    prompt.control = [ControlInput(ControlMode.reference, control_img, 0.7)]
+    inpaint = automatic_inpaint(image.extent, mask.bounds, Arch.sd15, prompt.positive)
+    job = create(
+        WorkflowKind.refine_region,
+        client,
+        canvas=image,
+        mask=mask,
+        inpaint=inpaint,
+        cond=prompt,
+        strength=0.6,
     )
-    job = workflow.generate(comfy, default_style(comfy), Extent(512, 512), control)
-
-    async def main():
-        await run_and_save(comfy, job, "test_ip_adapter_batch.png")
-
-    qtapp.run(main())
+    run_and_save(qtapp, client, job, "test_ip_adapter_region", image, mask)
 
 
-def test_upscale_simple(qtapp, comfy):
-    image = Image.load(image_dir / "beach_768x512.png")
-    job = workflow.upscale_simple(comfy, image, comfy.default_upscaler, 2.0)
+def test_ip_adapter_batch(qtapp, client):
+    image1 = Image.load(image_dir / "cat.webp")
+    image2 = Image.load(image_dir / "pegonia.webp")
+    control = [
+        ControlInput(ControlMode.reference, image1, 1.0),
+        ControlInput(ControlMode.reference, image2, 1.0),
+    ]
+    cond = ConditioningInput("", control=control)
+    job = create(WorkflowKind.generate, client, canvas=Extent(512, 512), cond=cond)
+    run_and_save(qtapp, client, job, "test_ip_adapter_batch")
 
-    async def main():
-        await run_and_save(comfy, job, "test_upscale_simple.png")
 
-    qtapp.run(main())
-
-
-@pytest.mark.parametrize("sdver", [SDVersion.sd15, SDVersion.sdxl])
-def test_upscale_tiled(qtapp, comfy, sdver):
-    image = Image.load(image_dir / "beach_768x512.png")
-    job = workflow.upscale_tiled(
-        comfy, image, comfy.default_upscaler, 2.0, default_style(comfy, sdver), 0.5
+def test_style_composition_sdxl(qtapp, client):
+    style_image = Image.load(image_dir / "watercolor.webp")
+    composition_image = Image.load(image_dir / "flowers.webp")
+    control = [
+        ControlInput(ControlMode.style, style_image, 1.0),
+        ControlInput(ControlMode.composition, composition_image, 0.8),
+    ]
+    job = create(
+        WorkflowKind.generate,
+        client,
+        canvas=Extent(1024, 1024),
+        cond=ConditioningInput("", control=control),
+        style=default_style(client, Arch.sdxl),
     )
-
-    async def main():
-        await run_and_save(comfy, job, f"test_upscale_tiled_{sdver.name}.png")
-
-    qtapp.run(main())
+    run_and_save(qtapp, client, job, "test_style_composition")
 
 
-def test_generate_live(qtapp, comfy):
-    scribble = Image.load(image_dir / "owls_scribble.png")
-    live = LiveParams(is_active=True, seed=1234)
-    cond = Conditioning("owls", "", [Control(ControlMode.scribble, scribble)])
-    job = workflow.generate(comfy, default_style(comfy), Extent(512, 512), cond, live)
+@pytest.mark.parametrize("sdver", [Arch.sd15, Arch.sdxl])
+def test_ip_adapter_face(qtapp, client, sdver):
+    if isinstance(client, CloudClient):
+        pytest.skip("IP-adapter FaceID is not available in the cloud")
+    extent = Extent(650, 650) if sdver == Arch.sd15 else Extent(1024, 1024)
+    image = Image.load(image_dir / "face.webp")
+    cond = ConditioningInput("portrait photo of a woman at a garden party")
+    cond.control = [ControlInput(ControlMode.face, image, 0.9)]
+    job = create(WorkflowKind.generate, client, canvas=extent, cond=cond)
+    run_and_save(qtapp, client, job, f"test_ip_adapter_face_{sdver.name}")
 
-    async def main():
-        await run_and_save(comfy, job, "test_generate_live.png")
 
-    qtapp.run(main())
+def test_upscale_simple(qtapp, client: Client):
+    image = Image.load(image_dir / "beach_768x512.webp")
+    job = workflow.prepare_upscale_simple(image, client.models.default_upscaler, 2.0)
+    run_and_save(qtapp, client, job, "test_upscale_simple")
 
 
-@pytest.mark.parametrize("sdver", [SDVersion.sd15, SDVersion.sdxl])
-def test_refine_live(qtapp, comfy, sdver):
-    image = Image.load(image_dir / "pegonia.png")
-    if sdver is SDVersion.sdxl:
+@pytest.mark.parametrize("sdver", [Arch.sd15, Arch.sdxl])
+def test_upscale_tiled(qtapp, client: Client, sdver):
+    image = Image.load(image_dir / "beach_768x512.webp")
+    job = create(
+        WorkflowKind.upscale_tiled,
+        client,
+        canvas=image,
+        upscale_model=client.models.default_upscaler,
+        upscale_factor=2.0,
+        style=default_style(client, sdver),
+        cond=ConditioningInput("4k uhd", control=[ControlInput(ControlMode.blur, None)]),
+        strength=0.5,
+    )
+    run_and_save(qtapp, client, job, f"test_upscale_tiled_{sdver.name}")
+
+
+def test_generate_live(qtapp, client):
+    scribble = Image.load(image_dir / "owls_scribble.webp")
+    job = create(
+        WorkflowKind.generate,
+        client,
+        canvas=Extent(512, 512),
+        cond=ConditioningInput("owls", control=[ControlInput(ControlMode.scribble, scribble)]),
+        is_live=True,
+    )
+    run_and_save(qtapp, client, job, "test_generate_live")
+
+
+@pytest.mark.parametrize("sdver", [Arch.sd15, Arch.sdxl])
+def test_refine_live(qtapp, client, sdver):
+    image = Image.load(image_dir / "pegonia.webp")
+    if sdver is Arch.sdxl:
         image = Image.scale(image, Extent(1024, 1024))  # result will be a bit blurry
-    live = LiveParams(is_active=True, seed=1234)
-    job = workflow.refine(comfy, default_style(comfy, sdver), image, Conditioning(), 0.4, live)
+    job = create(
+        WorkflowKind.refine,
+        client,
+        style=default_style(client, sdver),
+        canvas=image,
+        cond=ConditioningInput(""),
+        strength=0.4,
+        is_live=True,
+    )
+    run_and_save(qtapp, client, job, f"test_refine_live_{sdver.name}")
 
-    async def main():
-        await run_and_save(comfy, job, f"test_refine_live_{sdver.name}.png")
 
-    qtapp.run(main())
+def test_refine_max_pixels(qtapp, client):
+    perf_settings = PerformanceSettings(max_pixel_count=1)  # million pixels
+    image = Image.load(image_dir / "lake_1536x1024.webp")
+    cond = ConditioningInput("watercolor painting on structured paper, aquarelle, stylized")
+    job = create(
+        WorkflowKind.refine, client, canvas=image, cond=cond, strength=0.6, perf=perf_settings
+    )
+    run_and_save(qtapp, client, job, f"test_refine_max_pixels")
+
+
+def test_outpaint_resolution_multiplier(qtapp, client):
+    perf_settings = PerformanceSettings(batch_size=1, resolution_multiplier=0.8)
+    image = Image.create(Extent(2048, 1024))
+    beach = Image.load(image_dir / "beach_1536x1024.webp")
+    image.draw_image(beach, (512, 0))
+    mask = Mask.load(image_dir / "beach_outpaint_mask.png")
+    prompt = ConditioningInput("photo of a beach and jungle, nature photography, tropical")
+    params = automatic_inpaint(image.extent, mask.bounds, prompt=prompt.positive)
+    job = create(
+        WorkflowKind.inpaint,
+        client,
+        canvas=image,
+        mask=mask,
+        cond=prompt,
+        inpaint=params,
+        perf=perf_settings,
+    )
+    run_and_save(qtapp, client, job, f"test_outpaint_resolution_multiplier", image, mask)
+
+
+def test_lora(qtapp, client):
+    files = FileLibrary.instance()
+    lora = files.loras.add(File.local(test_dir / "data" / "animeoutlineV4_16.safetensors"))
+    style = default_style(client, Arch.sd15)
+    style.loras.append(dict(name=lora.id, strength=1.0))
+    job = create(
+        WorkflowKind.generate,
+        client,
+        files=files,
+        canvas=Extent(512, 512),
+        cond=ConditioningInput("manga, lineart, monochrome, sunflower field"),
+        style=style,
+    )
+    run_and_save(qtapp, client, job, "test_lora")
+
+
+def test_nsfw_filter(qtapp, client):
+    params = dict(cond=ConditioningInput("nude"))
+    job = create(WorkflowKind.generate, client, canvas=Extent(512, 512), **params)
+    job.nsfw_filter = 0.8
+    run_and_save(qtapp, client, job, "test_nsfw_filter")
+
+
+def test_translation(qtapp, client):
+    cond = ConditioningInput("rote (kerze) auf einer fensterbank", style="photo", language="de")
+    job = create(WorkflowKind.generate, client, canvas=Extent(512, 512), cond=cond)
+    run_and_save(qtapp, client, job, "test_translation")
+
+
+def test_custom_workflow(qtapp, client: Client):
+    if isinstance(client, CloudClient):
+        pytest.skip("Not supported in cloud")
+    workflow_json = test_dir / "data" / "workflow-custom.json"
+    workflow_dict = json.loads(workflow_json.read_text())
+    workflow_graph = ComfyWorkflow.import_graph(workflow_dict, client.models.node_inputs)
+    params = {
+        "1. Prompt": "a painting of a forest",
+        "2. Detail/2. Steps": 14,
+        "2. Detail/4. CFG": 3.5,
+    }
+    job = WorkflowInput(
+        WorkflowKind.custom,
+        images=ImageInput.from_extent(Extent(512, 512)),
+        sampling=SamplingInput("custom", "custom", 1, 1000, seed=1234),
+        custom_workflow=CustomWorkflowInput(workflow_graph.root, params),
+    )
+    assert job.images is not None
+    job.images.initial_image = Image.create(Extent(512, 512))
+    run_and_save(qtapp, client, job, "test_custom_workflow")
+
+
+inpaint_benchmark = {
+    "tori": (InpaintMode.fill, "photo of tori, japanese garden", None),
+    "bruges": (InpaintMode.fill, "photo of a canal in bruges, belgium", None),
+    "apple-tree": (
+        InpaintMode.expand,
+        "children's illustration of kids next to an apple tree",
+        Bounds(0, 640, 1024, 384),
+    ),
+    "girl-cornfield": (
+        InpaintMode.expand,
+        "anime artwork of girl in a cornfield",
+        Bounds(0, 0, 773 - 261, 768),
+    ),
+    "cuban-guitar": (InpaintMode.replace_background, "photo of a beach bar", None),
+    "jungle": (
+        InpaintMode.fill,
+        "concept artwork of a lake in a forest",
+        Bounds(680, 640, 1480, 1280),
+    ),
+    "street": (InpaintMode.remove_object, "photo of a street in tokyo", None),
+    "nature": (
+        InpaintMode.add_object,
+        "photo of a black bear standing in a stony river bed",
+        Bounds(420, 200, 604, 718),
+    ),
+    "park": (
+        InpaintMode.add_object,
+        "photo of a lady sitting on a bench in a park",
+        Bounds(310, 370, 940, 1110),
+    ),
+    "superman": (
+        InpaintMode.expand,
+        "superman giving a speech at a congress hall filled with people",
+        None,
+    ),
+}
+
+
+def run_inpaint_benchmark(
+    qtapp, client, sdver: Arch, prompt_mode: str, scenario: str, seed: int, out_dir: Path
+):
+    mode, prompt, bounds = inpaint_benchmark[scenario]
+    image = Image.load(image_dir / "inpaint" / f"{scenario}-image.webp")
+    mask = Mask.load(image_dir / "inpaint" / f"{scenario}-mask.webp")
+    if bounds:
+        mask = Mask.crop(mask, bounds)
+    text = ConditioningInput(prompt if prompt_mode == "prompt" else "")
+    params = detect_inpaint(mode, mask.bounds, sdver, text.positive, [], 1.0)
+    job = create(
+        WorkflowKind.inpaint,
+        client,
+        style=default_style(client, sdver),
+        canvas=image,
+        mask=mask,
+        cond=text,
+        inpaint=params,
+        seed=seed,
+    )
+    result_name = f"benchmark_inpaint_{scenario}_{sdver.name}_{prompt_mode}_{seed}"
+    run_and_save(qtapp, client, job, result_name, image, mask, output_dir=out_dir)
+
+
+def test_inpaint_benchmark(pytestconfig, qtapp, client):
+    if not pytestconfig.getoption("--benchmark"):
+        pytest.skip("Only runs with --benchmark")
+    if isinstance(client, CloudClient):
+        pytest.skip("Inpaint benchmark runs local")
+    print()
+
+    output_dir = config.benchmark_dir / datetime.now().strftime("%Y%m%d-%H%M")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    seeds = [4213, 897281]
+    prompt_modes = ["prompt", "noprompt"]
+    scenarios = inpaint_benchmark.keys()
+    sdvers = [Arch.sd15, Arch.sdxl]
+    runs = itertools.product(sdvers, scenarios, prompt_modes, seeds)
+
+    for sdver, scenario, prompt_mode, seed in runs:
+        mode, _, _ = inpaint_benchmark[scenario]
+        prompt_required = mode in [InpaintMode.add_object, InpaintMode.replace_background]
+        if prompt_required and prompt_mode == "noprompt":
+            continue
+
+        print("-", scenario, "|", sdver.name, "|", prompt_mode, "|", seed)
+        run_inpaint_benchmark(qtapp, client, sdver, prompt_mode, scenario, seed, output_dir)
+
+
+# def test_reproduce(qtapp, client: Client):
+#     workflow = {
+#         "conditioning": {
+#             "control": [{"strength": 0.5, "mode": "blur"}],
+#             "negative": "<redacted>",
+#             "positive": "<redacted>",
+#             "regions": [],
+#             "style": "<redacted>",
+#         },
+#         "images": {
+#             "extent": {
+#                 "desired": [672, 672],
+#                 "initial": [8736, 15552],
+#                 "input": [2912, 5184],
+#                 "target": [8736, 15552],
+#             },
+#             "initial_image": 0,
+#         },
+#         "kind": "upscale_tiled",
+#         "models": {
+#             "checkpoint": "realisticVisionV51_v51VAE.safetensors",
+#             "loras": [],
+#             "vae": "Checkpoint Default",
+#             "version": "sd15",
+#         },
+#         "sampling": {
+#             "cfg_scale": 7,
+#             "sampler": "dpmpp_2m",
+#             "scheduler": "karras",
+#             "seed": 1159574572,
+#             "start_step": 14,
+#             "total_steps": 20,
+#         },
+#         "upscale_model": "4x_NMKD-Superscale-SP_178000_G.pth",
+#     }
+#     image = Image.create(Extent(2912, 5184))
+#     images = ImageCollection([image])
+#     data, offsets = images.to_bytes()
+#     workflow["image_data"] = {"bytes": data, "offsets": offsets}
+#     input = WorkflowInput.from_dict(workflow)
+#     run_and_save(qtapp, client, input, "test_reproduce")

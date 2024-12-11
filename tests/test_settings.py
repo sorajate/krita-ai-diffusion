@@ -3,7 +3,8 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 
 from ai_diffusion.settings import PerformancePreset, Settings, Setting, ServerMode
-from ai_diffusion.style import Style, Styles, StyleSettings
+from ai_diffusion.style import Style, Styles, StyleSettings, SamplerPreset, SamplerPresets
+from ai_diffusion import style
 
 
 def test_get_set():
@@ -19,13 +20,12 @@ def test_get_set():
 
 def test_restore():
     s = Settings()
+    assert s.server_mode == Settings._server_mode.default
+
     s.history_size = 5
     s.server_mode = ServerMode.external
     s.restore()
-    assert (
-        s.history_size == Settings._history_size.default
-        and s.server_mode == Settings._server_mode.default
-    )
+    assert s.history_size == Settings._history_size.default and s.server_mode is ServerMode.managed
 
 
 def test_save():
@@ -48,7 +48,7 @@ def test_save():
 def test_performance_preset():
     s = Settings()
     s.performance_preset = PerformancePreset.low
-    assert s.batch_size == 2 and s.diffusion_tile_size == 1024
+    assert s.batch_size == 2 and s.max_pixel_count == 2 and s.resolution_multiplier == 1.0
 
 
 def style_is_default(style):
@@ -61,29 +61,60 @@ def style_is_default(style):
     )
 
 
-def test_styles():
-    with TemporaryDirectory(dir=Path(__file__).parent) as dir:
-        style = Style(Path(dir) / "test_style.json")
-        style.name = "Test Style"
-        style.save()
+def test_styles(tmp_path_factory):
+    builtin_dir = tmp_path_factory.mktemp("builtin")
+    user_dir = tmp_path_factory.mktemp("user")
 
-        styles = Styles(Path(dir))
-        assert len(styles) == 1
-        loaded_style = styles[0]
-        assert loaded_style.filename == style.filename
-        assert loaded_style.name == "Test Style"
-        assert styles.find(style.filename) == (loaded_style, 0)
-        assert styles.find("nonexistent.json") == (None, -1)
-        assert style_is_default(loaded_style)
+    style = Style(user_dir / "test_style.json")
+    style.name = "Test Style"
+    style.save()
+
+    styles = Styles(builtin_dir, user_dir)
+    assert len(styles) == 1
+    loaded_style = styles[0]
+    assert loaded_style.filename == style.filename
+    assert loaded_style.name == "Test Style"
+    assert styles.find(style.filename) == loaded_style
+    assert styles.find("nonexistent.json") is None
+    assert style_is_default(loaded_style)
 
 
-def test_bad_style_file():
-    with TemporaryDirectory(dir=Path(__file__).parent) as dir:
-        path = Path(dir) / "test_style.json"
-        path.write_text("bad json")
-        styles = Styles(Path(dir))
-        assert len(styles) == 1  # no error, default style inserted
-        assert style_is_default(styles[0])
+def test_style_folders(tmp_path_factory):
+    builtin_dir = tmp_path_factory.mktemp("builtin")
+    user_dir = tmp_path_factory.mktemp("user")
+
+    builtin = Style(builtin_dir / "test_style.json")
+    builtin.name = "Built-in Style"
+    builtin.save()
+
+    user = Style(user_dir / "test_style.json")
+    user.name = "User Style"
+    user.save()
+
+    styles = Styles(builtin_dir, user_dir)
+    assert len(styles) == 2
+    for style in styles:
+        if style.filepath == builtin.filepath:
+            assert style.name == "Built-in Style"
+        elif style.filepath == user.filepath:
+            assert style.name == "User Style"
+        else:
+            assert False
+
+    only_user = styles.filtered(show_builtin=False)
+    assert len(only_user) == 1
+    assert only_user[0].name == "User Style"
+
+
+def test_bad_style_file(tmp_path_factory):
+    builtin_dir = tmp_path_factory.mktemp("builtin")
+    user_dir = tmp_path_factory.mktemp("user")
+
+    path = user_dir / "test_style.json"
+    path.write_text("bad json")
+    styles = Styles(builtin_dir, user_dir)
+    assert len(styles) == 1  # no error, default style inserted
+    assert style_is_default(styles[0])
 
 
 def test_bad_style_type():
@@ -99,8 +130,75 @@ def test_bad_style_type():
         )
 
 
-def test_default_style():
-    with TemporaryDirectory(dir=Path(__file__).parent) as dir:
-        styles = Styles(Path(dir))
-        style = styles.default
-        assert style_is_default(style)
+def test_preferred_style():
+    checkpoints = ["cats", "birds", "snakes"]
+    style = Style(Path("test_style.json"))
+    assert style.preferred_checkpoint(checkpoints) == "not-found"
+    style.checkpoints = ["birds"]
+    assert style.preferred_checkpoint(checkpoints) == "birds"
+    style.checkpoints = ["dogs", "cats"]
+    assert style.preferred_checkpoint(checkpoints) == "cats"
+
+
+def test_default_style(tmp_path_factory):
+    styles = Styles(tmp_path_factory.mktemp("builtin"), tmp_path_factory.mktemp("user"))
+    style = styles.default
+    assert style_is_default(style)
+
+
+def test_duplicate_style(tmp_path_factory):
+    styles = Styles(tmp_path_factory.mktemp("builtin"), tmp_path_factory.mktemp("user"))
+    original = styles.create("original.json")
+    original.loras.append({"name": "lora", "strength": 1.0})
+    original.name = "Original"
+    original.live_sampler_steps = 42
+
+    copy = styles.create(original.filename, copy_from=original)
+    assert copy.filename == "original-1.json"
+    assert copy.name == "Original (Copy)"
+    assert copy.loras == original.loras
+    assert copy.live_sampler_steps == original.live_sampler_steps
+
+    copy.loras[0] = {"name": "lora2", "strength": 2.0}
+    assert copy.loras != original.loras
+
+
+def test_sampler_presets(tmp_path_factory):
+    dir = tmp_path_factory.mktemp("presets")
+
+    builtin_file = dir / "builtin.json"
+    builtin_file.write_text(
+        json.dumps(
+            {
+                "Builtin": {"sampler": "dpmpp_2m", "scheduler": "normal", "steps": 42, "cfg": 7.0},
+            }
+        )
+    )
+
+    user_file = dir / "user.json"
+    user_file.write_text(
+        json.dumps(
+            {
+                "User": {"sampler": "user_sampler", "scheduler": "normal", "steps": 13, "cfg": 1.0},
+            }
+        )
+    )
+
+    presets = SamplerPresets(builtin_file, user_file)
+    assert len(presets) == 2
+
+    builtin = presets["Builtin"]
+    assert builtin == SamplerPreset("dpmpp_2m", "normal", 42, 7.0)
+
+    user = presets["User"]
+    assert user == SamplerPreset("user_sampler", "normal", 13, 1.0)
+
+    presets.add_missing("DDIM", 99, 2.3)
+    assert len(presets) == 3
+    assert presets["DDIM"] == SamplerPreset("ddim", "ddim_uniform", 99, 2.3)
+
+
+def test_sampler_preset_conversion():
+    presets = SamplerPresets()
+    for old, new in style.legacy_map.items():
+        assert presets[old] == presets[new]

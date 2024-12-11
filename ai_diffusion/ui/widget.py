@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable, Optional
+from typing import Any, Callable, cast
 
 from PyQt5.QtWidgets import (
     QAction,
@@ -10,235 +10,191 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMenu,
     QSpinBox,
-    QDoubleSpinBox,
     QToolButton,
     QComboBox,
     QHBoxLayout,
     QVBoxLayout,
     QSizePolicy,
+    QStyle,
+    QStyleOption,
+    QWidgetAction,
+    QCheckBox,
+    QGridLayout,
+    QPushButton,
+    QFrame,
 )
-from PyQt5.QtGui import QColor, QFontMetrics, QKeyEvent, QPalette, QTextCursor
-from PyQt5.QtCore import Qt, QMetaObject, QSize, pyqtSignal
-import krita
+from PyQt5.QtGui import (
+    QDesktopServices,
+    QGuiApplication,
+    QFontMetrics,
+    QKeyEvent,
+    QMouseEvent,
+    QPalette,
+    QTextCursor,
+    QPainter,
+    QIcon,
+    QPaintEvent,
+    QKeySequence,
+)
+from PyQt5.QtCore import QObject, Qt, QMetaObject, QSize, pyqtSignal, QEvent, QUrl
+from krita import Krita
 
 from ..style import Style, Styles
-from ..image import Bounds
-from ..resources import ControlMode
 from ..root import root
-from ..client import filter_supported_styles, resolve_sd_version
-from ..properties import Binding, bind, bind_combo
-from ..jobs import Job, JobKind, JobState, JobQueue
-from ..model import Model, Workspace, ControlLayer
-from .settings import SettingsDialog
+from ..client import filter_supported_styles, resolve_arch
+from ..properties import Binding, Bind, bind, bind_combo
+from ..jobs import JobState, JobKind
+from ..model import Model, Workspace, SamplingQuality, ProgressKind, ErrorKind, Error, no_error
+from ..text import edit_attention, select_on_cursor_pos
+from ..localization import translate as _
+from ..util import ensure
+from ..workflow import apply_strength, snap_to_percent
+from ..settings import settings
+from .autocomplete import PromptAutoComplete
 from .theme import SignalBlocker
 from . import actions, theme
-from ..attention_edit import edit_attention, select_on_cursor_pos
 
 
-class QueueWidget(QToolButton):
-    _style = """
-        QToolButton {{ border: none; border-radius: 6px; background-color: {color}; color: white; }}
-        QToolButton::menu-indicator {{ width: 0px; }}"""
+class QueuePopup(QMenu):
+    _model: Model
+    _connections: list[QMetaObject.Connection]
 
-    _jobs: JobQueue
-
-    def __init__(self, parent):
+    def __init__(self, supports_batch=True, parent: QWidget | None = None):
         super().__init__(parent)
-        self._jobs = JobQueue()
-        self._jobs.count_changed.connect(self._update)
+        self._connections = []
 
-        queue_menu = QMenu(self)
-        queue_menu.addAction(self._create_action("Cancel active", actions.cancel_active))
-        queue_menu.addAction(self._create_action("Cancel queued", actions.cancel_queued))
-        queue_menu.addAction(self._create_action("Cancel all", actions.cancel_all))
-        self.setMenu(queue_menu)
+        palette = self.palette()
+        self.setObjectName("QueuePopup")
+        self.setStyleSheet(
+            f"""
+            QWidget#QueuePopup {{
+                background-color: {palette.window().color().name()}; 
+                border: 1px solid {palette.dark().color().name()};
+            }}"""
+        )
 
-        self.setStyleSheet(self._style.format(color=theme.background_inactive))
-        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self.setPopupMode(QToolButton.InstantPopup)
-        self.setArrowType(Qt.ArrowType.NoArrow)
-        self._update()
+        self._layout = QGridLayout()
+        self.setLayout(self._layout)
+
+        batch_label = QLabel(_("Batches"), self)
+        batch_label.setVisible(supports_batch)
+        self._layout.addWidget(batch_label, 0, 0)
+        batch_layout = QHBoxLayout()
+        self._batch_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._batch_slider.setMinimum(1)
+        self._batch_slider.setMaximum(10)
+        self._batch_slider.setSingleStep(1)
+        self._batch_slider.setPageStep(1)
+        self._batch_slider.setVisible(supports_batch)
+        self._batch_slider.setToolTip(_("Number of jobs to enqueue at once"))
+        self._batch_label = QLabel("1", self)
+        self._batch_label.setVisible(supports_batch)
+        batch_layout.addWidget(self._batch_slider)
+        batch_layout.addWidget(self._batch_label)
+        self._layout.addLayout(batch_layout, 0, 1)
+
+        self._seed_label = QLabel(_("Seed"), self)
+        self._layout.addWidget(self._seed_label, 1, 0)
+        self._seed_input = QSpinBox(self)
+        self._seed_check = QCheckBox(self)
+        self._seed_check.setText(_("Fixed"))
+        self._seed_input.setMinimum(0)
+        self._seed_input.setMaximum(2**31 - 1)
+        self._seed_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._seed_input.setToolTip(
+            _(
+                "The seed controls the random part of the output. A fixed seed value will always produce the same result for the same inputs."
+            )
+        )
+        self._randomize_seed = QToolButton(self)
+        self._randomize_seed.setIcon(theme.icon("random"))
+        seed_layout = QHBoxLayout()
+        seed_layout.addWidget(self._seed_check)
+        seed_layout.addWidget(self._seed_input)
+        seed_layout.addWidget(self._randomize_seed)
+        self._layout.addLayout(seed_layout, 1, 1)
+
+        enqueue_label = QLabel(_("Enqueue"), self)
+        self._queue_front_combo = QComboBox(self)
+        self._queue_front_combo.addItem(_("in Front (new jobs first)"), True)
+        self._queue_front_combo.addItem(_("at the Back"), False)
+        self._layout.addWidget(enqueue_label, 2, 0)
+        self._layout.addWidget(self._queue_front_combo, 2, 1)
+
+        cancel_label = QLabel(_("Cancel"), self)
+        self._layout.addWidget(cancel_label, 3, 0)
+        self._cancel_active = self._create_cancel_button(_("Active"), actions.cancel_active)
+        self._cancel_queued = self._create_cancel_button(_("Queued"), actions.cancel_queued)
+        self._cancel_all = self._create_cancel_button(_("All"), actions.cancel_all)
+        cancel_layout = QHBoxLayout()
+        cancel_layout.addWidget(self._cancel_active)
+        cancel_layout.addWidget(self._cancel_queued)
+        cancel_layout.addWidget(self._cancel_all)
+        self._layout.addLayout(cancel_layout, 3, 1)
+
+        self._model = root.active_model
 
     @property
-    def jobs(self):
-        return self._jobs
+    def model(self):
+        return self._model
 
-    @jobs.setter
-    def jobs(self, jobs: JobQueue):
-        self._jobs.count_changed.disconnect(self._update)
-        self._jobs = jobs
-        self._jobs.count_changed.connect(self._update)
-
-    def _update(self):
-        count = self._jobs.count(JobState.queued)
-        if self._jobs.any_executing():
-            self.setStyleSheet(self._style.format(color=theme.background_active))
-            if count > 0:
-                self.setToolTip(f"Generating image. {count} jobs queued - click to cancel.")
-            else:
-                self.setToolTip(f"Generating image. Click to cancel.")
-        else:
-            self.setStyleSheet(self._style.format(color=theme.background_inactive))
-            self.setToolTip("Idle.")
-        self.setText(f"+{count} ")
-
-    def _create_action(self, name: str, func: Callable[[], None]):
-        action = QAction(name, self)
-        action.triggered.connect(func)
-        return action
-
-
-class ControlWidget(QWidget):
-    _model: Model
-    _control: ControlLayer
-
-    def __init__(self, model: Model, control: ControlLayer, parent: ControlListWidget):
-        super().__init__(parent)
+    @model.setter
+    def model(self, model: Model):
+        Binding.disconnect_all(self._connections)
         self._model = model
-        self._control = control
+        self._randomize_seed.setEnabled(self._model.fixed_seed)
+        self._seed_input.setEnabled(self._model.fixed_seed)
+        self._batch_label.setText(str(self._model.batch_count))
+        self._connections = [
+            bind(self._model, "batch_count", self._batch_slider, "value"),
+            model.batch_count_changed.connect(lambda v: self._batch_label.setText(str(v))),
+            bind(self._model, "seed", self._seed_input, "value"),
+            bind(self._model, "fixed_seed", self._seed_check, "checked", Bind.one_way),
+            self._seed_check.toggled.connect(lambda v: setattr(self._model, "fixed_seed", v)),
+            self._model.fixed_seed_changed.connect(self._seed_input.setEnabled),
+            self._model.fixed_seed_changed.connect(self._randomize_seed.setEnabled),
+            self._randomize_seed.clicked.connect(self._model.generate_seed),
+            bind_combo(self._model, "queue_front", self._queue_front_combo),
+            model.jobs.count_changed.connect(self._update_cancel_buttons),
+        ]
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.setLayout(layout)
+    def _create_cancel_button(self, name: str, action: Callable[[], None]):
+        button = QToolButton(self)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        button.setText(name)
+        button.setIcon(theme.icon("cancel"))
+        button.setEnabled(False)
+        button.clicked.connect(action)
+        return button
 
-        self.mode_select = QComboBox(self)
-        self.mode_select.setStyleSheet(
-            "QComboBox { border:none; background-color:transparent; padding: 1px 12px 1px 2px;}"
-        )
-        for mode in (m for m in ControlMode if m is not ControlMode.inpaint):
-            icon = theme.icon(f"control-{mode.name}")
-            self.mode_select.addItem(icon, mode.text, mode)
-        bind_combo(control, "mode", self.mode_select)
+    def _update_cancel_buttons(self):
+        has_active = self._model.jobs.any_executing()
+        has_queued = self._model.jobs.count(JobState.queued) > 0
+        self._cancel_active.setEnabled(has_active)
+        self._cancel_queued.setEnabled(has_queued)
+        self._cancel_all.setEnabled(has_active or has_queued)
 
-        self.layer_select = QComboBox(self)
-        self.layer_select.setMinimumContentsLength(20)
-        self.layer_select.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLength
-        )
-        self._update_layers()
-        bind_combo(control, "layer_id", self.layer_select)
-        self._model.image_layers.changed.connect(self._update_layers)
-        control.has_active_job_changed.connect(lambda x: self.layer_select.setEnabled(not x))
-
-        self.generate_button = QToolButton(self)
-        self.generate_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.generate_button.setIcon(theme.icon("control-generate"))
-        self.generate_button.setToolTip("Generate control layer from current image")
-        self.generate_button.clicked.connect(control.generate)
-        control.has_active_job_changed.connect(lambda x: self.generate_button.setEnabled(not x))
-
-        self.add_pose_button = QToolButton(self)
-        self.add_pose_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.add_pose_button.setIcon(theme.icon("add-pose"))
-        self.add_pose_button.setToolTip("Add new character pose to selected layer")
-        self.add_pose_button.clicked.connect(self._add_pose_character)
-
-        self.strength_spin = QSpinBox(self)
-        self.strength_spin.setRange(0, 100)
-        self.strength_spin.setValue(int(control.strength * 100))
-        self.strength_spin.setSuffix("%")
-        self.strength_spin.setSingleStep(10)
-        self.strength_spin.setToolTip("Control strength")
-        bind(control, "strength", self.strength_spin, "value")
-
-        self.end_spin = QDoubleSpinBox(self)
-        self.end_spin.setRange(0.0, 1.0)
-        self.end_spin.setValue(control.end)
-        self.end_spin.setSingleStep(0.1)
-        self.end_spin.setToolTip("Control ending step ratio")
-        bind(control, "end", self.end_spin, "value")
-
-        self.error_text = QLabel(self)
-        self.error_text.setStyleSheet(f"color: {theme.red};")
-        self.error_text.setVisible(not control.is_supported)
-        control.error_text_changed.connect(self._set_error)
-        self._set_error(control.error_text)
-
-        self.remove_button = QToolButton(self)
-        self.remove_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.remove_button.setIcon(theme.icon("remove"))
-        self.remove_button.setToolTip("Remove control layer")
-        button_height = self.remove_button.iconSize().height()
-        self.remove_button.setIconSize(QSize(int(button_height * 1.25), button_height))
-        self.remove_button.setAutoRaise(True)
-        self.remove_button.clicked.connect(self.remove)
-
-        layout.addWidget(self.mode_select)
-        layout.addWidget(self.layer_select, 1)
-        layout.addWidget(self.generate_button)
-        layout.addWidget(self.add_pose_button)
-        layout.addWidget(self.strength_spin)
-        layout.addWidget(self.end_spin)
-        layout.addWidget(self.error_text, 1)
-        layout.addWidget(self.remove_button)
-
-        control.is_supported_changed.connect(self._update_visibility)
-        control.can_generate_changed.connect(self._update_visibility)
-        control.show_end_changed.connect(self._update_visibility)
-        control.is_pose_vector_changed.connect(self._update_visibility)
-        self._update_visibility()
-
-    def _update_layers(self):
-        layers: reversed[krita.Node] = reversed(self._model.image_layers)
-        with SignalBlocker(self.layer_select):
-            self.layer_select.clear()
-            index = -1
-            for layer in layers:
-                self.layer_select.addItem(layer.name(), layer.uniqueId())
-                if layer.uniqueId() == self._control.layer_id:
-                    index = self.layer_select.count() - 1
-            if index == -1 and self._control in self._model.control:
-                self.remove()
-            else:
-                self.layer_select.setCurrentIndex(index)
-
-    def remove(self):
-        self._model.control.remove(self._control)
-
-    def _add_pose_character(self):
-        self._model.document.add_pose_character(self._control.layer)
-
-    def _update_visibility(self):
-        def controls():
-            self.layer_select.setVisible(self._control.is_supported)
-            self.generate_button.setVisible(self._control.can_generate)
-            self.add_pose_button.setVisible(self._control.is_pose_vector)
-            self.strength_spin.setVisible(self._control.is_supported)
-            self.end_spin.setVisible(self._control.show_end)
-
-        def error():
-            self.error_text.setVisible(not self._control.is_supported)
-
-        if self._control.is_supported:
-            error()
-            controls()
-        else:  # always hide things to hide first to make space in the layout
-            controls()
-            error()
-
-    def _set_error(self, error: str):
-        parts = error.split("[", 2)
-        self.error_text.setText(parts[0])
-        if len(parts) > 1:
-            self.error_text.setToolTip(f"Missing one of the following models: {parts[1][:-1]}")
+    def mouseReleaseEvent(self, a0: QMouseEvent | None) -> None:
+        if parent := cast(QWidget, self.parent()):
+            parent.close()
+        return super().mouseReleaseEvent(a0)
 
 
-class ControlListWidget(QWidget):
-    _controls: list[ControlWidget]
-    _model: Model
-    _model_connections: list[QMetaObject.Connection]
+class QueueButton(QToolButton):
 
-    changed = pyqtSignal()
-
-    def __init__(self, model: Model, parent=None):
+    def __init__(self, supports_batch=True, parent: QWidget | None = None):
         super().__init__(parent)
-        self._model = model
-        self._controls = []
-        self._model_connections = []
+        self._model = root.active_model
+        self._connect_model()
 
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self.setLayout(self._layout)
+        self._popup = QueuePopup(supports_batch)
+        popup_action = QWidgetAction(self)
+        popup_action.setDefaultWidget(self._popup)
+        self.addAction(popup_action)
+
+        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._update()
 
     @property
     def model(self):
@@ -247,38 +203,45 @@ class ControlListWidget(QWidget):
     @model.setter
     def model(self, model: Model):
         if self._model != model:
-            Binding.disconnect_all(self._model_connections)
+            Binding.disconnect_all(self._connections)
             self._model = model
-            while len(self._controls) > 0:
-                self._remove_widget(self._controls[0])
-            for control in self._model.control:
-                self._add_widget(control)
-            self._model_connections = [
-                model.control.added.connect(self._add_widget),
-                model.control.removed.connect(self._remove_widget),
-            ]
+            self._popup.model = model
+            self._connect_model()
 
-    def _add_widget(self, control: ControlLayer):
-        widget = ControlWidget(self._model, control, self)
-        self._controls.append(widget)
-        self._layout.addWidget(widget)
+    def _connect_model(self):
+        self._connections = [
+            self._model.jobs.count_changed.connect(self._update),
+            self._model.progress_kind_changed.connect(self._update),
+        ]
 
-    def _remove_widget(self, widget: ControlWidget | ControlLayer):
-        if isinstance(widget, ControlLayer):
-            widget = next(w for w in self._controls if w._control == widget)
-        self._controls.remove(widget)
-        widget.deleteLater()
+    def _update(self):
+        count = self._model.jobs.count(JobState.queued)
+        queued_msg = _("{count} jobs queued.", count=count)
+        cancel_msg = _("Click to cancel.")
 
+        if self._model.progress_kind is ProgressKind.upload:
+            self.setIcon(theme.icon("queue-upload"))
+            self.setToolTip(_("Uploading models.") + f" {queued_msg} {cancel_msg}")
+            count += 1
+        elif self._model.jobs.any_executing():
+            self.setIcon(theme.icon("queue-active"))
+            if count > 0:
+                self.setToolTip(_("Generating image.") + f" {queued_msg} {cancel_msg}")
+            else:
+                self.setToolTip(_("Generating image.") + f" {cancel_msg}")
+            count += 1
+        else:
+            self.setIcon(theme.icon("queue-inactive"))
+            self.setToolTip(_("Idle."))
+        self.setText(f"{count} ")
 
-class ControlLayerButton(QToolButton):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.setIcon(theme.icon("control-add"))
-        self.setToolTip("Add control layer")
-        self.setAutoRaise(True)
-        icon_height = self.iconSize().height()
-        self.setIconSize(QSize(int(icon_height * 1.25), icon_height))
+    def sizeHint(self) -> QSize:
+        original = super().sizeHint()
+        width = original.height() * 0.75 + self.fontMetrics().width(" 99 ") + 20
+        return QSize(int(width), original.height())
+
+    def paintEvent(self, a0):
+        _paint_tool_drop_down(self, self.text())
 
 
 class StyleSelectWidget(QWidget):
@@ -286,8 +249,9 @@ class StyleSelectWidget(QWidget):
     _styles: list[Style]
 
     value_changed = pyqtSignal(Style)
+    quality_changed = pyqtSignal(SamplingQuality)
 
-    def __init__(self, parent):
+    def __init__(self, parent: QWidget | None, show_quality=False):
         super().__init__(parent)
         self._value = Styles.list().default
 
@@ -298,7 +262,14 @@ class StyleSelectWidget(QWidget):
         self._combo = QComboBox(self)
         self.update_styles()
         self._combo.currentIndexChanged.connect(self.change_style)
-        layout.addWidget(self._combo)
+        layout.addWidget(self._combo, 3)
+
+        if show_quality:
+            self._quality_combo = QComboBox(self)
+            self._quality_combo.addItem(_("Fast"), SamplingQuality.fast.value)
+            self._quality_combo.addItem(_("Quality"), SamplingQuality.quality.value)
+            self._quality_combo.currentIndexChanged.connect(self.change_quality)
+            layout.addWidget(self._quality_combo, 1)
 
         settings = QToolButton(self)
         settings.setIcon(theme.icon("settings"))
@@ -312,18 +283,17 @@ class StyleSelectWidget(QWidget):
 
     def update_styles(self):
         comfy = root.connection.client_if_connected
-        self._styles = filter_supported_styles(Styles.list(), comfy)
+        self._styles = filter_supported_styles(Styles.list().filtered(), comfy)
         with SignalBlocker(self._combo):
             self._combo.clear()
             for style in self._styles:
-                icon = theme.sd_version_icon(resolve_sd_version(style, comfy))
+                icon = theme.checkpoint_icon(resolve_arch(style, comfy))
                 self._combo.addItem(icon, style.name, style.filename)
             if self._value in self._styles:
                 self._combo.setCurrentText(self._value.name)
             elif len(self._styles) > 0:
                 self._value = self._styles[0]
                 self._combo.setCurrentIndex(0)
-                self.value_changed.emit(self._value)
 
     def change_style(self):
         style = self._styles[self._combo.currentIndex()]
@@ -331,7 +301,13 @@ class StyleSelectWidget(QWidget):
             self._value = style
             self.value_changed.emit(style)
 
+    def change_quality(self):
+        quality = SamplingQuality(self._quality_combo.currentData())
+        self.quality_changed.emit(quality)
+
     def show_settings(self):
+        from .settings import SettingsDialog
+
         SettingsDialog.instance().show(self._value)
 
     @property
@@ -374,24 +350,38 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
 
     _line_count = 2
 
-    def __init__(self, parent):
+    def __init__(self, parent: QWidget | None):
         super().__init__(parent)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTabChangesFocus(True)
+        self.setFrameStyle(QFrame.Shape.NoFrame)
         self.line_count = 2
-        self.is_negative = False
 
-    def keyPressEvent(self, event: QKeyEvent):
-        handle_weight_adjustment(self, event)
+        self._completer = PromptAutoComplete(self)
+        self.textChanged.connect(self._completer.check_completion)
 
-        if (
-            event.key() == Qt.Key.Key_Return
-            and event.modifiers() == Qt.KeyboardModifier.ShiftModifier
-        ):
+    def event(self, e: QEvent | None):
+        assert e is not None
+        # Ctrl+Backspace should be handled by QPlainTextEdit, not Krita.
+        if e.type() == QEvent.Type.ShortcutOverride:
+            assert isinstance(e, QKeyEvent)
+            if e.matches(QKeySequence.DeleteStartOfWord):
+                e.accept()
+        return super().event(e)
+
+    def keyPressEvent(self, e: QKeyEvent | None):
+        assert e is not None
+        if self._completer.is_active and e.key() in PromptAutoComplete.action_keys:
+            e.ignore()
+            return
+
+        handle_weight_adjustment(self, e)
+
+        if e.key() == Qt.Key.Key_Return and e.modifiers() == Qt.KeyboardModifier.ShiftModifier:
             self.activated.emit()
         else:
-            super().keyPressEvent(event)
+            super().keyPressEvent(e)
 
     @property
     def line_count(self):
@@ -400,8 +390,8 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
     @line_count.setter
     def line_count(self, value: int):
         self._line_count = value
-        fm = QFontMetrics(self.document().defaultFont())
-        self.setFixedHeight(fm.lineSpacing() * value + 6)
+        fm = QFontMetrics(ensure(self.document()).defaultFont())
+        self.setFixedHeight(fm.lineSpacing() * value + 8)
 
     def hasSelectedText(self) -> bool:
         return self.textCursor().hasSelection()
@@ -415,6 +405,11 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
     def cursorPosition(self) -> int:
         return self.textCursor().position()
 
+    def setCursorPosition(self, pos: int):
+        cursor = self.textCursor()
+        cursor.setPosition(pos)
+        self.setTextCursor(cursor)
+
     def text(self) -> str:
         return self.toPlainText()
 
@@ -423,18 +418,29 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
 
     def setSelection(self, start: int, end: int):
         new_cursor = self.textCursor()
-        new_cursor.setPosition(min(end, len(self.toPlainText())))
-        new_cursor.setPosition(min(start, len(self.toPlainText())), QTextCursor.KeepAnchor)
+        new_cursor.setPosition(min(end, len(self.text())))
+        new_cursor.setPosition(min(start, len(self.text())), QTextCursor.KeepAnchor)
         self.setTextCursor(new_cursor)
 
 
 class SingleLineTextPromptWidget(QLineEdit):
-    def keyPressEvent(self, event: QKeyEvent):
-        handle_weight_adjustment(self, event)
-        super().keyPressEvent(event)
+
+    _completer: PromptAutoComplete
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self._completer = PromptAutoComplete(self)
+        self.textChanged.connect(self._completer.check_completion)
+        self.setFrame(False)
+        self.setStyleSheet(f"QLineEdit {{ background: transparent; }}")
+
+    def keyPressEvent(self, a0: QKeyEvent | None):
+        assert a0 is not None
+        handle_weight_adjustment(self, a0)
+        super().keyPressEvent(a0)
 
 
-class TextPromptWidget(QWidget):
+class TextPromptWidget(QFrame):
     """Wraps a single or multi-line text widget, with ability to switch between them.
     Using QPlainTextEdit set to a single line doesn't work properly because it still
     scrolls to the next line when eg. selecting and then looks like it's empty."""
@@ -442,11 +448,8 @@ class TextPromptWidget(QWidget):
     activated = pyqtSignal()
     text_changed = pyqtSignal(str)
 
-    _multi: MultiLineTextPromptWidget
-    _single: QLineEdit
     _line_count = 2
     _is_negative = False
-    _base_color: QColor
 
     def __init__(self, line_count=2, is_negative=False, parent=None):
         super().__init__(parent)
@@ -455,7 +458,7 @@ class TextPromptWidget(QWidget):
         self._layout = QVBoxLayout()
         self._layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(self._layout)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self._multi = MultiLineTextPromptWidget(self)
         self._multi.line_count = self._line_count
@@ -483,16 +486,15 @@ class TextPromptWidget(QWidget):
 
     @property
     def text(self):
-        return self._multi.toPlainText() if self._line_count > 1 else self._single.text()
+        return self._multi.text() if self._line_count > 1 else self._single.text()
 
     @text.setter
     def text(self, value: str):
         if value == self.text:
             return
-        if self._line_count > 1:
-            self._multi.setPlainText(value)
-        else:
-            self._single.setText(value)
+        widget = self._multi if self._line_count > 1 else self._single
+        with SignalBlocker(widget):  # avoid auto-completion on non-user input
+            widget.setText(value)
 
     @property
     def line_count(self):
@@ -515,19 +517,98 @@ class TextPromptWidget(QWidget):
     @is_negative.setter
     def is_negative(self, value: bool):
         self._is_negative = value
-        for w in [self._multi, self._single]:
-            palette: QPalette = w.palette()
-            color = self._base_color
+        for w in (self._multi, self._single):
             if not value:
-                w.setPlaceholderText("Describe the content you want to see, or leave empty.")
+                w.setPlaceholderText(_("Describe the content you want to see, or leave empty."))
             else:
-                w.setPlaceholderText("Describe content you want to avoid.")
-                color = QColor(color.red(), color.green() - 8, color.blue() - 8)
-            palette.setColor(QPalette.ColorRole.Base, color)
-            w.setPalette(palette)
+                w.setPlaceholderText(_("Describe content you want to avoid."))
+
+        if value:
+            self.setContentsMargins(0, 2, 0, 2)
+            self.setFrameStyle(QFrame.Shape.StyledPanel)
+            self.setStyleSheet(f"QFrame {{ background: rgba(255, 0, 0, 15); }}")
+        else:
+            self.setFrameStyle(QFrame.Shape.NoFrame)
+
+    @property
+    def has_focus(self):
+        return self._multi.hasFocus() or self._single.hasFocus()
+
+    @has_focus.setter
+    def has_focus(self, value: bool):
+        if value:
+            if self._line_count > 1:
+                self._multi.setFocus()
+            else:
+                self._single.setFocus()
+
+    def install_event_filter(self, obj: QObject):
+        self._multi.installEventFilter(obj)
+        self._single.installEventFilter(obj)
+
+    def move_cursor_to_end(self):
+        if self._line_count > 1:
+            cursor = self._multi.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self._multi.setTextCursor(cursor)
+        else:
+            self._single.setCursorPosition(len(self._single.text()))
+
+
+class StrengthSnapping:
+    model: Model
+
+    def __init__(self, model: Model):
+        self.model = model
+
+    def get_steps(self) -> tuple[int, int]:
+        is_live = self.model.workspace is Workspace.live
+        if self.model.workspace is Workspace.animation:
+            is_live = self.model.animation.sampling_quality is SamplingQuality.fast
+        return self.model.style.get_steps(is_live=is_live)
+
+    def nearest_percent(self, value: int) -> int | None:
+        _, max_steps = self.get_steps()
+        steps, start_at_step = self.apply_strength(value)
+        return snap_to_percent(steps, start_at_step, max_steps=max_steps)
+
+    def apply_strength(self, value: int) -> tuple[int, int]:
+        min_steps, max_steps = self.get_steps()
+        strength = value / 100
+        return apply_strength(strength, steps=max_steps, min_steps=min_steps)
+
+
+# SpinBox variant that allows manually entering strength values,
+# but snaps to model_steps on step actions (scrolling, arrows, arrow keys).
+class StrengthSpinBox(QSpinBox):
+    snapping: StrengthSnapping | None
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.snapping = None
+        # for manual input
+        self.setMinimum(1)
+        self.setMaximum(100)
+
+    def stepBy(self, steps):
+        value = max(self.minimum(), min(self.maximum(), self.value() + steps))
+        if self.snapping is not None:
+            # keep going until we hit a new snap point
+            current_point = self.nearest_snap_point(self.value())
+            while self.nearest_snap_point(value) == current_point and value > 1:
+                value += 1 if steps > 0 else -1
+            value = self.nearest_snap_point(value)
+        self.setValue(value)
+
+    def nearest_snap_point(self, value: int) -> int:
+        assert self.snapping
+        return self.snapping.nearest_percent(value) or (int(value / 5) * 5)
 
 
 class StrengthWidget(QWidget):
+    _model: Model | None = None
+    _value: int = 100
+
     value_changed = pyqtSignal(float)
 
     def __init__(self, slider_range: tuple[int, int] = (1, 100), parent=None):
@@ -539,37 +620,72 @@ class StrengthWidget(QWidget):
         self._slider = QSlider(Qt.Orientation.Horizontal, self)
         self._slider.setMinimum(slider_range[0])
         self._slider.setMaximum(slider_range[1])
+        self._slider.setValue(self._value)
         self._slider.setSingleStep(5)
-        self._slider.valueChanged.connect(self.notify_changed)
+        self._slider.valueChanged.connect(self.slider_changed)
 
-        self._input = QSpinBox(self)
-        self._input.setMinimum(1)
-        self._input.setMaximum(100)
-        self._input.setSingleStep(5)
-        self._input.setPrefix("Strength: ")
+        self._input = StrengthSpinBox(self)
+        self._input.setValue(self._value)
+        self._input.setPrefix(_("Strength") + ": ")
         self._input.setSuffix("%")
         self._input.valueChanged.connect(self.notify_changed)
+
+        settings.changed.connect(self.update_suffix)
 
         self._layout.addWidget(self._slider)
         self._layout.addWidget(self._input)
 
+    def slider_changed(self, value: int):
+        if self._input.snapping is not None:
+            value = self._input.snapping.nearest_percent(value) or value
+        self.notify_changed(value)
+
     def notify_changed(self, value: int):
-        if self._slider.value() != value:
+        if self._update_value(value):
+            self.value_changed.emit(self.value)
+
+    def _update_value(self, value: int):
+        with SignalBlocker(self._slider), SignalBlocker(self._input):
             self._slider.setValue(value)
-        if self._input.value() != value:
             self._input.setValue(value)
-        self.value_changed.emit(self.value)
+        if value != self._value:
+            self._value = value
+            self.update_suffix()
+            return True
+        return False
+
+    @property
+    def model(self):
+        return self._model
+
+    @model.setter
+    def model(self, model: Model):
+        if self._model:
+            self._model.style_changed.disconnect(self.update_suffix)
+            self._model.animation.sampling_quality_changed.disconnect(self.update_suffix)
+        self._model = model
+        self._model.style_changed.connect(self.update_suffix)
+        self._model.animation.sampling_quality_changed.connect(self.update_suffix)
+        self._input.snapping = StrengthSnapping(self._model)
+        self.update_suffix()
 
     @property
     def value(self):
-        return self._slider.value() / 100
+        return self._value / 100
 
     @value.setter
     def value(self, value: float):
         if value == self.value:
             return
-        self._slider.setValue(int(value * 100))
-        self._input.setValue(int(value * 100))
+        self._update_value(round(value * 100))
+
+    def update_suffix(self):
+        if not self._input.snapping or not settings.show_steps:
+            self._input.setSuffix("%")
+            return
+
+        steps, start_at_step = self._input.snapping.apply_strength(self._value)
+        self._input.setSuffix(f"% ({steps - start_at_step}/{steps})")
 
 
 class WorkspaceSelectWidget(QToolButton):
@@ -577,6 +693,8 @@ class WorkspaceSelectWidget(QToolButton):
         Workspace.generation: theme.icon("workspace-generation"),
         Workspace.upscaling: theme.icon("workspace-upscaling"),
         Workspace.live: theme.icon("workspace-live"),
+        Workspace.animation: theme.icon("workspace-animation"),
+        Workspace.custom: theme.icon("workspace-custom"),
     }
 
     _value = Workspace.generation
@@ -585,17 +703,23 @@ class WorkspaceSelectWidget(QToolButton):
         super().__init__(parent)
 
         menu = QMenu(self)
-        menu.addAction(self._create_action("Generate", Workspace.generation))
-        menu.addAction(self._create_action("Upscale", Workspace.upscaling))
-        menu.addAction(self._create_action("Live", Workspace.live))
+        menu.addAction(self._create_action(_("Generate"), Workspace.generation))
+        menu.addAction(self._create_action(_("Upscale"), Workspace.upscaling))
+        menu.addAction(self._create_action(_("Live"), Workspace.live))
+        menu.addAction(self._create_action(_("Animation"), Workspace.animation))
+        menu.addAction(self._create_action(_("Graph"), Workspace.custom))
 
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.setMenu(menu)
         self.setPopupMode(QToolButton.InstantPopup)
-        self.setAutoRaise(True)
-        self.setToolTip("Switch between workspaces: image generation, upscaling, live preview")
-        self.setMinimumWidth(int(self.sizeHint().width() * 1.4))
+        self.setToolTip(
+            _("Switch between workspaces: image generation, upscaling, live preview and animation.")
+        )
+        self.setMinimumWidth(int(self.sizeHint().width() * 1.6))
         self.value = Workspace.generation
+
+    def paintEvent(self, a0):
+        _paint_tool_drop_down(self)
 
     @property
     def value(self):
@@ -612,3 +736,218 @@ class WorkspaceSelectWidget(QToolButton):
         action.setIconVisibleInMenu(True)
         action.triggered.connect(actions.set_workspace(workspace))
         return action
+
+
+class GenerateButton(QPushButton):
+    model: Model
+    _operation: str
+    _kind: JobKind
+    _cost: int = 0
+    _cost_icon: QIcon
+
+    def __init__(self, kind: JobKind, parent: QWidget):
+        super().__init__(parent)
+        self.model = root.active_model
+        self._operation = _("Generate")
+        self._kind = kind
+        self._cost_icon = theme.icon("interstice")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+
+    @property
+    def operation(self):
+        return self._operation
+
+    @operation.setter
+    def operation(self, value: str):
+        self._operation = value
+        self.update()
+
+    def minimumSizeHint(self):
+        fm = self.fontMetrics()
+        return QSize(fm.width(self._operation) + 40, 12 + int(1.3 * fm.height()))
+
+    def enterEvent(self, a0: QEvent | None):
+        if client := root.connection.client_if_connected:
+            if client.user:
+                self._cost = self.model.estimate_cost(self._kind)
+
+    def leaveEvent(self, a0: QEvent | None):
+        self._cost = 0
+
+    def paintEvent(self, a0: QPaintEvent | None) -> None:
+        opt = QStyleOption()
+        opt.initFrom(self)
+        opt.state |= QStyle.StateFlag.State_Sunken if self.isDown() else 0
+        painter = QPainter(self)
+        fm = self.fontMetrics()
+        style = ensure(self.style())
+        rect = self.rect()
+        pixmap = self.icon().pixmap(int(fm.height() * 1.3))
+        is_hover = int(opt.state) & QStyle.StateFlag.State_MouseOver
+        element = QStyle.PrimitiveElement.PE_PanelButtonCommand
+        vcenter = Qt.AlignmentFlag.AlignVCenter
+        content_width = fm.width(self._operation) + 5 + pixmap.width()
+        content_rect = rect.adjusted(int(0.5 * (rect.width() - content_width)), 0, 0, 0)
+        style.drawPrimitive(element, opt, painter, self)
+        style.drawItemPixmap(painter, content_rect, vcenter, pixmap)
+        content_rect = content_rect.adjusted(pixmap.width() + 5, 0, 0, 0)
+        style.drawItemText(painter, content_rect, vcenter, self.palette(), True, self._operation)
+
+        if is_hover and self._cost > 0:
+            cost_width = fm.width(str(self._cost))
+            pixmap = self._cost_icon.pixmap(fm.height())
+            cost_rect = rect.adjusted(rect.width() - pixmap.width() - cost_width - 16, 0, 0, 0)
+            painter.setOpacity(0.3)
+            painter.drawLine(
+                cost_rect.left(), cost_rect.top() + 6, cost_rect.left(), cost_rect.bottom() - 6
+            )
+            painter.setOpacity(0.7)
+            cost_rect = cost_rect.adjusted(6, 0, 0, 0)
+            style.drawItemText(painter, cost_rect, vcenter, self.palette(), True, str(self._cost))
+            cost_rect = cost_rect.adjusted(cost_width + 4, 0, 0, 0)
+            style.drawItemPixmap(painter, cost_rect, vcenter, pixmap)
+
+
+class ErrorBox(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._error = no_error
+        self._original_error = ""
+
+        self.setObjectName("errorBox")
+        self.setFrameStyle(QFrame.Shape.StyledPanel)
+
+        self._label = QLabel(self)
+        self._label.setWordWrap(True)
+        self._label.setOpenExternalLinks(True)
+        self._label.setTextFormat(Qt.TextFormat.RichText)
+
+        self._copy_button = QToolButton(self)
+        self._copy_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self._copy_button.setIcon(Krita.instance().icon("edit-copy"))
+        self._copy_button.setToolTip(_("Copy error message to clipboard"))
+        self._copy_button.setAutoRaise(True)
+        self._copy_button.clicked.connect(self._copy_error)
+
+        self._recharge_button = QToolButton(self)
+        self._recharge_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._recharge_button.setText(_("Charge"))
+        self._recharge_button.setIcon(theme.icon("interstice"))
+        self._recharge_button.clicked.connect(self._recharge)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.addWidget(self._label)
+        layout.addWidget(self._copy_button)
+        layout.addWidget(self._recharge_button)
+
+        self.reset()
+
+    def reset(self, color: str = theme.red):
+        self._copy_button.setVisible(False)
+        self._recharge_button.setVisible(False)
+        self._label.setStyleSheet(f"color: {color};")
+        if color == theme.red:
+            self.setStyleSheet("QFrame#errorBox { border: 1px solid #a01020; }")
+        else:
+            self.setStyleSheet(None)
+        self.hide()
+
+    @property
+    def error(self):
+        return self._error
+
+    @error.setter
+    def error(self, error: Error):
+        self.reset()
+        self._error = error
+        self._original_error = error.message if error else ""
+        if error.kind is ErrorKind.insufficient_funds:
+            self._show_payment_error(error.data)
+        elif error:
+            self._show_error(error.message)
+
+    def _show_error(self, text: str):
+        if text.count("\n") > 3:
+            lines = text.split("\n")
+            n = 1
+            text = lines[-n]
+            while n < len(lines) and text.strip() == "":
+                n += 1
+                text = lines[-n]
+        if len(text) > 60 * 3:
+            text = text[: 60 * 2] + " [...] " + text[-60:]
+        self._label.setText(text)
+        if text != self._original_error:
+            self._label.setToolTip(self._original_error)
+        self._copy_button.setVisible(True)
+        self.show()
+
+    def _show_payment_error(self, data: dict[str, Any] | None):
+        self.reset(theme.yellow)
+        message = "Insufficient funds"
+        if data:
+            message = _(
+                "Insufficient funds - generation would cost {cost} tokens. Remaining tokens: {tokens}",
+                cost=data["cost"],
+                tokens=data["credits"],
+            )
+        self._label.setText(message)
+        self._recharge_button.setVisible(True)
+        self.show()
+
+    def _copy_error(self):
+        if clipboard := QGuiApplication.clipboard():
+            clipboard.setText(self._original_error)
+
+    def _recharge(self):
+        QDesktopServices.openUrl(QUrl("https://www.interstice.cloud/user"))
+
+
+def create_wide_tool_button(icon_name: str, text: str, parent=None):
+    button = QToolButton(parent)
+    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+    button.setIcon(theme.icon(icon_name))
+    button.setToolTip(text)
+    button.setAutoRaise(True)
+    icon_height = button.iconSize().height()
+    button.setIconSize(QSize(int(icon_height * 1.25), icon_height))
+    return button
+
+
+def create_framed_label(text: str, parent=None):
+    frame = QFrame(parent)
+    frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Plain)
+    label = QLabel(parent=frame)
+    label.setText(text)
+    frame_layout = QHBoxLayout()
+    frame_layout.setContentsMargins(4, 2, 4, 2)
+    frame_layout.addWidget(label)
+    frame.setLayout(frame_layout)
+    return frame, label
+
+
+def _paint_tool_drop_down(widget: QToolButton, text: str | None = None):
+    opt = QStyleOption()
+    opt.initFrom(widget)
+    painter = QPainter(widget)
+    style = ensure(widget.style())
+    rect = widget.rect()
+    pixmap = widget.icon().pixmap(int(rect.height() * 0.75))
+    element = QStyle.PrimitiveElement.PE_Widget
+    if int(opt.state) & QStyle.StateFlag.State_MouseOver:
+        element = QStyle.PrimitiveElement.PE_PanelButtonCommand
+    style.drawPrimitive(element, opt, painter, widget)
+    style.drawItemPixmap(
+        painter,
+        rect.adjusted(4, 0, 0, 0),
+        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        pixmap,
+    )
+    if text:
+        text_rect = rect.adjusted(pixmap.width() + 4, 0, 0, 0)
+        style.drawItemText(
+            painter, text_rect, Qt.AlignmentFlag.AlignVCenter, widget.palette(), True, text
+        )
+    painter.translate(int(0.5 * rect.width() - 10), 0)
+    style.drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorArrowDown, opt, painter)
