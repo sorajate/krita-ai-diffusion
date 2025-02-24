@@ -1,112 +1,149 @@
 from __future__ import annotations
-from typing import cast
+from pathlib import Path
+from typing import Literal, cast
+from weakref import WeakValueDictionary
 import krita
 from krita import Krita
 from PyQt5.QtCore import QObject, QUuid, QByteArray, QTimer, pyqtSignal
-from PyQt5.QtGui import QImage
 
 from .image import Extent, Bounds, Mask, Image
+from .layer import Layer, LayerManager, LayerType
 from .pose import Pose
-from .util import client_logger as log
+from .localization import translate as _
+from .util import acquire_elements
 
 
-class Document:
+class Document(QObject):
     """Document interface. Used as placeholder when there is no open Document in Krita."""
+
+    selection_bounds_changed = pyqtSignal()
+    current_time_changed = pyqtSignal()
+
+    _layers: LayerManager
+
+    def __init__(self):
+        super().__init__()
+        self._layers = LayerManager(None)
 
     @property
     def extent(self):
         return Extent(0, 0)
 
     @property
-    def is_active(self):
-        return Krita.instance().activeDocument() is None
+    def filename(self) -> str:
+        return ""
 
-    @property
-    def is_valid(self):
-        return True
-
-    def check_color_mode(self):
+    def check_color_mode(self) -> tuple[Literal[True], None] | tuple[Literal[False], str]:
         return True, None
 
     def create_mask_from_selection(
-        self, grow: float, feather: float, padding: float, min_size=0, square=False
+        self, padding: float = 0.0, multiple=8, min_size=0, square=False, invert=False
     ) -> tuple[Mask, Bounds] | tuple[None, None]:
         raise NotImplementedError
 
-    def create_mask_from_layer(self, padding: float, is_inpaint: bool) -> tuple[Mask, Bounds, None]:
-        raise NotImplementedError
-
     def get_image(
-        self, bounds: Bounds | None = None, exclude_layers: list[krita.Node] | None = None
-    ):
-        raise NotImplementedError
-
-    def get_layer_image(self, layer: krita.Node, bounds: Bounds | None) -> Image:
-        raise NotImplementedError
-
-    def insert_layer(
-        self, name: str, img: Image, bounds: Bounds, below: krita.Node | None = None
-    ) -> krita.Node:
-        raise NotImplementedError
-
-    def insert_vector_layer(
-        self, name: str, svg: str, below: krita.Node | None = None
-    ) -> krita.Node:
-        raise NotImplementedError
-
-    def set_layer_content(self, layer: krita.Node, img: Image, bounds: Bounds):
-        raise NotImplementedError
-
-    def hide_layer(self, layer: krita.Node):
+        self, bounds: Bounds | None = None, exclude_layers: list[Layer] | None = None
+    ) -> Image:
         raise NotImplementedError
 
     def resize(self, extent: Extent):
         raise NotImplementedError
 
-    def add_pose_character(self, layer: krita.Node):
+    def annotate(self, key: str, value: QByteArray):
+        pass
+
+    def find_annotation(self, key: str) -> QByteArray | None:
+        return None
+
+    def remove_annotation(self, key: str):
+        pass
+
+    def add_pose_character(self, layer: Layer):
         raise NotImplementedError
 
-    def create_layer_observer(self) -> LayerObserver:
-        return LayerObserver(None)
-
-    @property
-    def active_layer(self) -> krita.Node:
+    def import_animation(self, files: list[Path], offset: int = 0):
         raise NotImplementedError
 
     @property
-    def resolution(self):
+    def layers(self) -> LayerManager:
+        return self._layers
+
+    @property
+    def selection_bounds(self) -> Bounds | None:
+        return None
+
+    @property
+    def resolution(self) -> float:
+        return 0.0
+
+    @property
+    def playback_time_range(self) -> tuple[int, int]:
+        return 0, 0
+
+    @property
+    def current_time(self) -> int:
         return 0
+
+    @property
+    def is_valid(self) -> bool:
+        return True
+
+    @property
+    def is_active(self) -> bool:
+        return Krita.instance().activeDocument() is None
 
 
 class KritaDocument(Document):
-    """Wrapper around a Krita Document (opened image). Manages multiple image layers and
-    allows to retrieve and modify pixel data."""
+    """Wrapper around a Krita Document (opened image). Allows to retrieve and modify pixel data.
+    Keeps track of selection and current time changes by polling at a fixed interval.
+    """
 
     _doc: krita.Document
+    _id: QUuid
+    _layers: LayerManager
+    _poller: QTimer
+    _selection_bounds: Bounds | None = None
+    _current_time: int = 0
+    _instances: WeakValueDictionary[str, KritaDocument] = WeakValueDictionary()
 
     def __init__(self, krita_document: krita.Document):
+        super().__init__()
         self._doc = krita_document
+        self._id = krita_document.rootNode().uniqueId()
+        self._poller = QTimer()
+        self._poller.setInterval(20)
+        self._poller.timeout.connect(self._poll)
+        self._poller.start()
+        self._instances[self._id.toString()] = self
+        self._layers = LayerManager(krita_document)
 
-    @staticmethod
-    def active():
-        doc = Krita.instance().activeDocument()
-        return KritaDocument(doc) if doc else None
+    @classmethod
+    def active(cls):
+        if doc := Krita.instance().activeDocument():
+            if (
+                doc not in acquire_elements(Krita.instance().documents())
+                or doc.activeNode() is None
+            ):
+                return None
+            id = doc.rootNode().uniqueId().toString()
+            return cls._instances.get(id) or KritaDocument(doc)
+        return None
 
     @property
     def extent(self):
         return Extent(self._doc.width(), self._doc.height())
 
     @property
-    def is_active(self):
-        return self._doc == Krita.instance().activeDocument()
+    def filename(self):
+        return self._doc.fileName()
 
     @property
-    def is_valid(self):
-        return self._doc in Krita.instance().documents()
+    def layers(self):
+        return self._layers
 
     def check_color_mode(self):
         model = self._doc.colorModel()
-        msg_fmt = "Incompatible document: Color {0} must be {1} (current {0}: {2})"
+        msg_fmt = _("Incompatible document: Color {0} must be {1} (current {0}: {2})")
         if model != "RGBA":
             return False, msg_fmt.format("model", "RGB/Alpha", model)
         depth = self._doc.colorDepth()
@@ -115,7 +152,7 @@ class KritaDocument(Document):
         return True, None
 
     def create_mask_from_selection(
-        self, grow: float, feather: float, padding: float, min_size=0, square=False
+        self, padding: float = 0.0, multiple=8, min_size=0, square=False, invert=False
     ):
         user_selection = self._doc.selection()
         if not user_selection:
@@ -130,139 +167,106 @@ class KritaDocument(Document):
         )
         original_bounds = Bounds.clamp(original_bounds, self.extent)
         size_factor = original_bounds.extent.diagonal
-        grow_pixels = int(grow * size_factor)
-        feather_radius = int(feather * size_factor)
         padding_pixels = int(padding * size_factor)
 
-        if grow_pixels > 0:
-            selection.grow(grow_pixels, grow_pixels)
-        if feather_radius > 0:
-            selection.feather(feather_radius)
+        if invert:
+            selection.invert()
 
         bounds = _selection_bounds(selection)
-        bounds = Bounds.pad(bounds, padding_pixels, multiple=8, min_size=min_size, square=square)
+        bounds = Bounds.pad(
+            bounds, padding_pixels, multiple=multiple, min_size=min_size, square=square
+        )
         bounds = Bounds.clamp(bounds, self.extent)
         data = selection.pixelData(*bounds)
         return Mask(bounds, data), original_bounds
 
-    def create_mask_from_layer(self, padding: float, is_inpaint: bool):
-        image_bounds = Bounds(0, 0, *self.extent)
-        if context_selection := self._doc.selection():
-            image_bounds = Bounds.clamp(_selection_bounds(context_selection), self.extent)
-
-        assert self.active_layer.type() == "selectionmask"
-        layer = cast(krita.SelectionMask, self.active_layer)
-        mask_selection = layer.selection()
-        mask_bounds = image_bounds
-        if is_inpaint:
-            mask_bounds = _selection_bounds(mask_selection)
-            pad = int(mask_bounds.extent.diagonal * padding)
-            mask_bounds = Bounds.pad(mask_bounds, pad, 512, 8)
-            mask_bounds = Bounds.restrict(mask_bounds, image_bounds)
-
-        data: QByteArray = layer.projectionPixelData(*mask_bounds)
-        assert data is not None and data.size() >= mask_bounds.extent.pixel_count
-        mask = Mask(mask_bounds, data)
-
-        log.debug(
-            f"Using experimental selection mask {self.active_layer.name()}, mask bounds:"
-            f" {mask.bounds}, image bounds: {image_bounds}"
-        )
-        return mask, image_bounds, None
-
-    def get_image(
-        self, bounds: Bounds | None = None, exclude_layers: list[krita.Node] | None = None
-    ):
-        excluded: list[krita.Node] = []
+    def get_image(self, bounds: Bounds | None = None, exclude_layers: list[Layer] | None = None):
+        excluded: list[Layer] = []
         if exclude_layers:
-            for layer in filter(lambda l: l.visible(), exclude_layers):
-                layer.setVisible(False)
+            for layer in filter(lambda l: l.is_visible, exclude_layers):
+                layer.hide()
                 excluded.append(layer)
         if len(excluded) > 0:
-            # This is quite slow and blocks the UI. Maybe async spinning on tryBarrierLock works?
             self._doc.refreshProjection()
 
         bounds = bounds or Bounds(0, 0, self._doc.width(), self._doc.height())
-        img = QImage(self._doc.pixelData(*bounds), *bounds.extent, QImage.Format.Format_ARGB32)
+        img = Image.from_packed_bytes(self._doc.pixelData(*bounds), bounds.extent)
 
         for layer in excluded:
-            layer.setVisible(True)
+            layer.show()
         if len(excluded) > 0:
             self._doc.refreshProjection()
-        return Image(img)
-
-    def get_layer_image(self, layer: krita.Node, bounds: Bounds | None):
-        bounds = bounds or Bounds.from_qrect(layer.bounds())
-        data: QByteArray = layer.projectionPixelData(*bounds)
-        assert data is not None and data.size() >= bounds.extent.pixel_count * 4
-        return Image(QImage(data, *bounds.extent, QImage.Format.Format_ARGB32))
-
-    def insert_layer(self, name: str, img: Image, bounds: Bounds, below: krita.Node | None = None):
-        layer = self._doc.createNode(name, "paintlayer")
-        above = _find_layer_above(self._doc, below)
-        self._doc.rootNode().addChildNode(layer, above)
-        layer.setPixelData(img.data, *bounds)
-        self._doc.refreshProjection()
-        return layer
-
-    def insert_vector_layer(self, name: str, svg: str, below: krita.Node | None = None):
-        layer = self._doc.createVectorLayer(name)
-        above = _find_layer_above(self._doc, below)
-        self._doc.rootNode().addChildNode(layer, above)
-        layer.addShapesFromSvg(svg)
-        self._doc.refreshProjection()
-        return layer
-
-    def set_layer_content(self, layer: krita.Node, img: Image, bounds: Bounds):
-        layer_bounds = Bounds.from_qrect(layer.bounds())
-        if layer_bounds != bounds:
-            # layer.cropNode(*bounds)  <- more efficient, but clutters the undo stack
-            blank = Image.create(layer_bounds.extent, fill=0)
-            layer.setPixelData(blank.data, *layer_bounds)
-        layer.setPixelData(img.data, *bounds)
-        layer.setVisible(True)
-        self._doc.refreshProjection()
-        return layer
-
-    def hide_layer(self, layer: krita.Node):
-        layer.setVisible(False)
-        self._doc.refreshProjection()
-        return layer
+        return img
 
     def resize(self, extent: Extent):
         res = self._doc.resolution()
         self._doc.scaleImage(extent.width, extent.height, res, res, "Bilinear")
 
-    def add_pose_character(self, layer: krita.Node):
-        assert layer.type() == "vectorlayer"
-        _pose_layers.add_character(cast(krita.VectorLayer, layer))
+    def annotate(self, key: str, value: QByteArray):
+        self._doc.setAnnotation(f"ai_diffusion/{key}", f"AI Diffusion Plugin: {key}", value)
 
-    def create_layer_observer(self):
-        return LayerObserver(self._doc)
+    def find_annotation(self, key: str) -> QByteArray | None:
+        result = self._doc.annotation(f"ai_diffusion/{key}")
+        return result if result.size() > 0 else None
+
+    def remove_annotation(self, key: str):
+        self._doc.removeAnnotation(f"ai_diffusion/{key}")
+
+    def add_pose_character(self, layer: Layer):
+        assert layer.type is LayerType.vector
+        _pose_layers.add_character(cast(krita.VectorLayer, layer.node))
+
+    def import_animation(self, files: list[Path], offset: int = 0):
+        success = self._doc.importAnimation([str(f) for f in files], offset, 1)
+        if not success and len(files) > 0:
+            folder = files[0].parent
+            raise RuntimeError(f"Failed to import animation from {folder}")
 
     @property
-    def active_layer(self):
-        return self._doc.activeNode()
+    def selection_bounds(self):
+        return self._selection_bounds
 
     @property
     def resolution(self):
         return self._doc.resolution() / 72.0  # KisImage::xRes which is applied to vectors
 
+    @property
+    def playback_time_range(self):
+        return self._doc.playBackStartTime(), self._doc.playBackEndTime()
 
-def _traverse_layers(node: krita.Node, type_filter=None):
-    for child in node.childNodes():
-        yield from _traverse_layers(child, type_filter)
-        if not type_filter or child.type() in type_filter:
-            yield child
+    @property
+    def current_time(self):
+        return self._doc.currentTime()
 
+    @property
+    def is_valid(self):
+        return self._doc in acquire_elements(Krita.instance().documents())
 
-def _find_layer_above(doc: krita.Document, layer_below: krita.Node | None):
-    if layer_below:
-        nodes = doc.rootNode().childNodes()
-        index = nodes.index(layer_below)
-        if index >= 1:
-            return nodes[index - 1]
-    return None
+    @property
+    def is_active(self):
+        return self._doc == Krita.instance().activeDocument()
+
+    def _poll(self):
+        if self.is_valid:
+            selection = self._doc.selection()
+            selection_bounds = _selection_bounds(selection) if selection else None
+            if selection_bounds != self._selection_bounds:
+                self._selection_bounds = selection_bounds
+                self.selection_bounds_changed.emit()
+
+            current_time = self.current_time
+            if current_time != self._current_time:
+                self._current_time = current_time
+                self.current_time_changed.emit()
+        else:
+            self._poller.stop()
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if isinstance(other, KritaDocument):
+            return self._id == other._id
+        return False
 
 
 def _selection_bounds(selection: krita.Selection):
@@ -280,57 +284,6 @@ def _selection_is_entire_document(selection: krita.Selection, extent: Extent):
     return is_opaque
 
 
-class LayerObserver(QObject):
-    managed_layer_types = [
-        "paintlayer",
-        "vectorlayer",
-        "grouplayer",
-        "filelayer",
-        "clonelayer",
-        "filterlayer",
-    ]
-
-    changed = pyqtSignal()
-
-    _doc: krita.Document | None
-    _layers: list[krita.Node]
-    _timer: QTimer
-
-    def __init__(self, doc: krita.Document | None):
-        super().__init__()
-        self._doc = doc
-        self._layers = []
-        if doc is not None:
-            self._timer = QTimer()
-            self._timer.setInterval(500)
-            self._timer.timeout.connect(self.update)
-            self._timer.start()
-
-    def update(self):
-        assert self._doc is not None
-        root_node = self._doc.rootNode()
-        if root_node is None:
-            return  # Document has been closed
-        layers = list(_traverse_layers(root_node, self.managed_layer_types))
-        if len(layers) != len(self._layers) or any(
-            a.uniqueId() != b.uniqueId() for a, b in zip(layers, self._layers)
-        ):
-            self._layers = layers
-            self.changed.emit()
-
-    def find(self, id: QUuid):
-        return next((l for l in self._layers if l.uniqueId() == id), None)
-
-    def __iter__(self):
-        return iter(self._layers)
-
-    def __getitem__(self, index):
-        return self._layers[index]
-
-    def __len__(self):
-        return len(self._layers)
-
-
 class PoseLayers:
     _layers: dict[str, Pose] = {}
     _timer = QTimer()
@@ -344,20 +297,23 @@ class PoseLayers:
         doc = KritaDocument.active()
         if not doc:
             return
-        layer = doc.active_layer
-        if not layer or layer.type() != "vectorlayer":
+        try:
+            layer = doc.layers.active
+        except Exception:
+            return
+        if not layer or layer.type is not LayerType.vector:
             return
 
-        layer = cast(krita.VectorLayer, layer)
+        layer = cast(krita.VectorLayer, layer.node)
         pose = self._layers.setdefault(layer.uniqueId(), Pose(doc.extent))
-        self._update(layer, layer.shapes(), pose, doc.resolution)
+        self._update(layer, acquire_elements(layer.shapes()), pose, doc.resolution)
 
     def add_character(self, layer: krita.VectorLayer):
         doc = KritaDocument.active()
         assert doc is not None
         pose = self._layers.setdefault(layer.uniqueId(), Pose(doc.extent))
         svg = Pose.create_default(doc.extent, pose.people_count).to_svg()
-        shapes = layer.addShapesFromSvg(svg)
+        shapes = acquire_elements(layer.addShapesFromSvg(svg))
         self._update(layer, shapes, pose, doc.resolution)
 
     def _update(

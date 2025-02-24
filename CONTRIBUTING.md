@@ -10,6 +10,39 @@ Having a look at the log files can provide additional information for troublesho
 
 When you open a new issue, please attach the log files. Other useful information to include: OS (Windows/Linux/Mac), Krita version, Plugin version, GPU vendor.
 
+## Translations (Localization)
+
+You can create or improve a translation for the plugin interface into your language.
+Language files are stored in the `ai_diffusion/langauge` folder. Each translation has its own
+file, typically named using a language code (eg. `en.json` for English).
+If no file for your language exists, you can use the `new_language.json.template` file and
+rename it. It will show up in the plugin's language settings after a restart.
+
+You can check [existing translations here](https://github.com/Acly/krita-ai-diffusion/tree/main/ai_diffusion/language) - this might be more up-to-date than your local installation!
+
+To edit a localization file, open the file in a text editor and provide translations for
+each of the english text strings. For example, to provide a German translation, it could look
+like this:
+```json
+{
+  "id": "de",
+  "name": "Deutsch",
+  "translations": {
+    "(Custom)": "(Benutzerdefiniert)",
+    "<No text prompt>": "<Keine Text-Eingabe>",
+    "Active": "Aktiv",
+    "Add Content": "Inhalte hinzufügen",
+    "Could not find LoRA '{lora}' used by sampler preset '{name}'": "LoRA '{lora}' konnte nicht gefunden werden, wird aber von Sampler '{name}' benutzt",
+    ...
+  }
+}
+```
+
+**Important:** `{placeholders}` must be left unmodified! They will be replaced with actual content during runtime.
+
+To update an existing translation (eg. after the plugin has been updated and new text was added)
+simply search for entries which are `null`. These are valid, but not translated yet.
+
 ## Contributing code
 
 For bigger changes, it makes sense to create an issue first to discuss a proposal before time is comitted.
@@ -27,7 +60,12 @@ The easiest way to run a development version of the plugin is to use symlinks:
 
 ### Code formatting
 
-The codebase uses [black](https://github.com/psf/black) for formatting. The project root contains a `pyproject.toml` to configure the line length, it should be picked up automatically.
+The codebase uses [ruff](https://docs.astral.sh/ruff/) for linting. You can
+use an IDE integration, or check locally by running in the repository root:
+```
+ruff format
+ruff check
+```
 
 ### Code style
 
@@ -37,18 +75,25 @@ Code style follows the official Python recommendations. Only exception: no `ALL_
 
 Type annotations should be used where types can't be inferred. Basic type checks are enabled for the project and should not report errors.
 
-The `Krita` module is special in that it is usually only available when running inside Krita. To make type checking work, include `scripts/typeshed` in your `PYTHONPATH`.
+The `Krita` module is special in that it is usually only available when running inside Krita. To make type checking work an interface file is located in `scripts/typeshed`.
 
-Configuration for VSCode with Pylance (.vscode/settings.json):
-```
-{
-  "python.analysis.typeCheckingMode": "basic",
-  "python.analysis.exclude": [
-    "scripts/typeshed/**",
-    "ai_diffusion/websockets/**"
-  ]
-}
-```
+You can run `pyright` from the repository root to perform type checks on the entire codebase. This is also done by the CI.
+
+### Debug
+
+The project includes a `launch.json` for VSCode which is configured to attach to
+a running Krita process. This allows to use the visual debugger for exceptions,
+breakpoints, inspecting and stepping through the code. Start debugging via the
+"Run and Debug" tab (F5).
+
+The way it works is:
+1. `debugpy` is added to the `ai_diffusion` folder as a git submodule to make it
+   available inside Krita's embedded Python
+1. `extension.py` starts a debug server if the `debugpy` module is present
+   (skipped for release deployments)
+2. VSCode (or more generally any `debugpy` client) attaches to the server
+
+You can also add breakpoints inside the code with `import debugpy; debugpy.breakpoint()`.
 
 ### Tests
 
@@ -65,7 +110,7 @@ pytest tests
 Some tests require a running ComfyUI server. This should be automated... but for now it's not.
 
 ### What is tested
-Generating images is tested. Because it takes a lot of time the number of tests is limited. Because it's very random, images are not compared (but this can be solved with consistent installation and fixed seeds).
+Generating images is tested. Because it takes a lot of time the number of tests is limited. Images are not compared in most cases, as they tend to frequently change with updates to dependencies.
 
 Functionality which uses Krita's API is _not_ tested. It just doesn't work outside Krita without a comprehensive mock.
 
@@ -75,11 +120,11 @@ Everything else has tests. Mostly. If effort is reasonable, tests are expected. 
 
 ### Testing the installer
 
-Testing changes to the installer is annoying because of the file sizes involved. There are some things that help. You can preload all model files with the following script:
+Testing changes to the installer is annoying because of the file sizes involved. There are some things that help. You can preload model files with the following script:
 ```
-python scripts/docker.py
+python scripts/download_models.py --minimal scripts/downloads
 ```
-This _can_ be used to build a docker image afterwards, but it's not necessary for testing.
+This will download the minimum required models and store them in `scripts/downloads`.
 
 The following command does some automated testing for installation and upgrade. It starts a local file server which pulls preloaded models, so it's reasonably fast and doesn't download the entire internet.
 ```
@@ -90,5 +135,3 @@ You can also run the file server manually. Then you can start Krita with the `HO
 python scripts/file_server.py
 
 HOSTMAP=1 /your/krita/install/krita
-```
-Note that the mock file server likes to transmit corrupted files if they are very large (eg. SDXL checkpoint)... not sure why (?)

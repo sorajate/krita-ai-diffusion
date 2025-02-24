@@ -1,23 +1,23 @@
 from __future__ import annotations
 import asyncio
-import locale
 from enum import Enum
 from itertools import chain
 from pathlib import Path
 import shutil
-import subprocess
+import re
 from typing import Callable, NamedTuple, Optional, Union
 from PyQt5.QtNetwork import QNetworkAccessManager
 
 from .settings import settings, ServerBackend
-from . import resources
-from .resources import CustomNode, ModelResource, SDVersion
+from . import eventloop, resources
+from .resources import CustomNode, ModelResource, ModelRequirements, Arch
 from .network import download, DownloadProgress
-from .util import ZipFile, is_windows, client_logger as log, server_logger as server_log
+from .localization import translate as _
+from .util import ZipFile, is_windows, create_process, decode_pipe_bytes, determine_system_encoding
+from .util import client_logger as log, server_logger as server_log
 
 
 _exe = ".exe" if is_windows else ""
-_process_flags = subprocess.CREATE_NO_WINDOW if is_windows else 0
 
 
 class ServerState(Enum):
@@ -49,7 +49,6 @@ class Server:
     version: Optional[str] = None
 
     _python_cmd: Optional[Path] = None
-    _pip_cmd: Optional[Path] = None
     _cache_dir: Path
     _version_file: Path
     _process: Optional[asyncio.subprocess.Process] = None
@@ -80,18 +79,18 @@ class Server:
         python_search_paths = [self.path / "python", self.path / "venv" / "bin"]
         python_path = _find_component(python_pkg, python_search_paths)
         if python_path is None:
-            self._python_cmd = _find_program("python3", "python")
-            self._pip_cmd = _find_program("pip3", "pip")
+            self._python_cmd = _find_program(
+                "python3.12", "python3.11", "python3.10", "python3", "python"
+            )
         else:
             self._python_cmd = python_path / f"python{_exe}"
-            self._pip_cmd = python_path / "pip"
-            if is_windows:
-                self._pip_cmd = python_path / "Scripts" / "pip.exe"
 
         if not (self.has_comfy and self.has_python):
             self.state = ServerState.not_installed
-            self.missing_resources = resources.all
+            self.missing_resources = resources.all_resources
             return
+
+        eventloop.run(determine_system_encoding(str(self._python_cmd)))
 
         assert self.comfy_dir is not None
         missing_nodes = [
@@ -101,21 +100,10 @@ class Server:
         ]
         self.missing_resources += missing_nodes
 
-        def find_missing(
-            folder: Path, resources: list[ModelResource], ver: SDVersion | None = None
-        ):
-            return [
-                res.name
-                for res in resources
-                if (not ver or res.sd_version is ver)
-                and not (folder / res.folder / res.filename).exists()
-            ]
-
-        self.missing_resources += find_missing(
-            self.comfy_dir, resources.required_models, SDVersion.all
-        )
-        missing_sd15 = find_missing(self.comfy_dir, resources.required_models, SDVersion.sd15)
-        missing_sdxl = find_missing(self.comfy_dir, resources.required_models, SDVersion.sdxl)
+        model_folders = [self.path, self.comfy_dir]
+        self.missing_resources += find_missing(model_folders, resources.required_models, Arch.all)
+        missing_sd15 = find_missing(model_folders, resources.required_models, Arch.sd15)
+        missing_sdxl = find_missing(model_folders, resources.required_models, Arch.sdxl)
         if len(self.missing_resources) > 0 or (len(missing_sd15) > 0 and len(missing_sdxl) > 0):
             self.state = ServerState.missing_resources
         else:
@@ -123,9 +111,9 @@ class Server:
         self.missing_resources += missing_sd15 + missing_sdxl
 
         # Optional resources
-        self.missing_resources += find_missing(self.comfy_dir, resources.default_checkpoints)
-        self.missing_resources += find_missing(self.comfy_dir, resources.upscale_models)
-        self.missing_resources += find_missing(self.comfy_dir, resources.optional_models)
+        self.missing_resources += find_missing(model_folders, resources.default_checkpoints)
+        self.missing_resources += find_missing(model_folders, resources.upscale_models)
+        self.missing_resources += find_missing(model_folders, resources.optional_models)
 
     async def _install(self, cb: InternalCB):
         self.state = ServerState.installing
@@ -134,29 +122,27 @@ class Server:
         network = QNetworkAccessManager()
         self._cache_dir = self.path / ".cache"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._version_file.write_text("incomplete")
 
-        no_python = self._python_cmd is None or self._pip_cmd is None
-        if is_windows and (self.comfy_dir is None or no_python):
+        if is_windows and (self.comfy_dir is None or self._python_cmd is None):
             # On Windows install an embedded version of Python
             python_dir = self.path / "python"
             self._python_cmd = python_dir / f"python{_exe}"
-            self._pip_cmd = python_dir / "Scripts" / f"pip{_exe}"
             await install_if_missing(python_dir, self._install_python, network, cb)
-        elif not is_windows and (self.comfy_dir is None or self._pip_cmd is None):
+        elif not is_windows and (self.comfy_dir is None or not (self.path / "venv").exists()):
             # On Linux a system Python is required to create a virtual environment
             python_dir = self.path / "venv"
             await install_if_missing(python_dir, self._create_venv, cb)
             self._python_cmd = python_dir / "bin" / "python3"
-            self._pip_cmd = python_dir / "bin" / "pip3"
-        assert self._python_cmd is not None and self._pip_cmd is not None
-        log.info(f"Using Python: {await get_python_version(self._python_cmd)}, {self._python_cmd}")
-        log.info(f"Using pip: {await get_python_version(self._pip_cmd)}, {self._pip_cmd}")
+        assert self._python_cmd is not None
+        await self._log_python_version()
+        await determine_system_encoding(str(self._python_cmd))
 
         comfy_dir = self.comfy_dir or self.path / "ComfyUI"
         if not self.has_comfy:
             await try_install(comfy_dir, self._install_comfy, comfy_dir, network, cb)
 
-        for pkg in resources.required_custom_nodes:
+        for pkg in chain(resources.required_custom_nodes, resources.optional_custom_nodes):
             dir = comfy_dir / "custom_nodes" / pkg.folder
             await install_if_missing(dir, self._install_custom_node, pkg, network, cb)
 
@@ -165,18 +151,25 @@ class Server:
         cb("Finished", f"Installation finished in {self.path}")
         self.check_install()
 
+    async def _log_python_version(self):
+        if self._python_cmd is not None:
+            python_ver = await get_python_version_string(self._python_cmd)
+            log.info(f"Using Python: {python_ver}, {self._python_cmd}")
+            pip_ver = await get_python_version_string(self._python_cmd, "-m", "pip")
+            log.info(f"Using pip: {pip_ver}")
+
     def _pip_install(self, *args):
         return [self._python_cmd, "-su", "-m", "pip", "install", *args]
 
     async def _install_python(self, network: QNetworkAccessManager, cb: InternalCB):
-        url = "https://www.python.org/ftp/python/3.10.11/python-3.10.11-embed-amd64.zip"
-        archive_path = self._cache_dir / "python-3.10.11-embed-amd64.zip"
+        url = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+        archive_path = self._cache_dir / "python-3.11.9-embed-amd64.zip"
         dir = self.path / "python"
 
         await _download_cached("Python", network, url, archive_path, cb)
         await _extract_archive("Python", archive_path, dir, cb)
 
-        python_pth = dir / "python310._pth"
+        python_pth = dir / "python311._pth"
         cb("Installing Python", f"Patching {python_pth}")
         with open(python_pth, "a") as file:
             file.write("import site\n")
@@ -185,6 +178,7 @@ class Server:
         get_pip_file = dir / "get-pip.py"
         await _download_cached("Python", network, git_pip_url, get_pip_file, cb)
         await _execute_process("Python", [self._python_cmd, get_pip_file], dir, cb)
+        await _execute_process("Python", self._pip_install("wheel", "setuptools"), dir, cb)
 
         cb("Installing Python", f"Patching {python_pth}")
         _prepend_file(python_pth, "../ComfyUI\n")
@@ -192,6 +186,14 @@ class Server:
 
     async def _create_venv(self, cb: InternalCB):
         cb("Creating Python virtual environment", f"Creating venv in {self.path / 'venv'}")
+        assert self._python_cmd is not None
+        python_version, major, minor = await get_python_version(self._python_cmd)
+        if major is not None and minor is not None and (major < 3 or minor < 9):
+            raise Exception(
+                _(
+                    "Python version 3.9 or higher is required, but found {version} at {location}. Please make sure a compatible version of Python is installed and can be found by the Krita process."
+                ).format(version=python_version, location=self._python_cmd)
+            )
         venv_cmd = [self._python_cmd, "-m", "venv", "venv"]
         await _execute_process("Python", venv_cmd, self.path, cb)
 
@@ -202,21 +204,20 @@ class Server:
         await _extract_archive("ComfyUI", archive_path, comfy_dir.parent, cb)
         temp_comfy_dir = comfy_dir.parent / f"ComfyUI-{resources.comfy_version}"
 
-        torch_args = ["torch", "torchvision", "torchaudio"]
-        if self.backend is ServerBackend.cpu or self.backend is ServerBackend.mps:
+        torch_args = ["torch~=2.5.1", "torchvision~=0.20.1", "torchaudio~=2.5.1"]
+        if self.backend is ServerBackend.cpu:
             torch_args += ["--index-url", "https://download.pytorch.org/whl/cpu"]
         elif self.backend is ServerBackend.cuda:
-            torch_args += ["--index-url", "https://download.pytorch.org/whl/cu121"]
+            torch_args += ["--index-url", "https://download.pytorch.org/whl/cu124"]
+        elif self.backend is ServerBackend.directml:
+            torch_args = ["numpy<2", "torch-directml"]
         await _execute_process("PyTorch", self._pip_install(*torch_args), self.path, cb)
 
         requirements_txt = temp_comfy_dir / "requirements.txt"
         await _execute_process("ComfyUI", self._pip_install("-r", requirements_txt), self.path, cb)
 
-        if self.backend is ServerBackend.directml:
-            # for some reason this must come AFTER ComfyUI requirements
-            await _execute_process("PyTorch", self._pip_install("torch-directml"), self.path, cb)
-
-        rename_extracted_folder("ComfyUI", comfy_dir, resources.comfy_version)
+        _configure_extra_model_paths(temp_comfy_dir)
+        await rename_extracted_folder("ComfyUI", comfy_dir, resources.comfy_version)
         self.comfy_dir = comfy_dir
         cb("Installing ComfyUI", "Finished installing ComfyUI")
 
@@ -231,12 +232,33 @@ class Server:
         resource_zip_path = self._cache_dir / f"{pkg.folder}-{pkg.version}.zip"
         await _download_cached(pkg.name, network, resource_url, resource_zip_path, cb)
         await _extract_archive(pkg.name, resource_zip_path, folder.parent, cb)
-        rename_extracted_folder(pkg.name, folder, pkg.version)
+        await rename_extracted_folder(pkg.name, folder, pkg.version)
 
         requirements_txt = folder / "requirements.txt"
         if requirements_txt.exists():
             await _execute_process(pkg.name, self._pip_install("-r", requirements_txt), folder, cb)
         cb(f"Installing {pkg.name}", f"Finished installing {pkg.name}")
+
+    async def _install_insightface(self, network: QNetworkAccessManager, cb: InternalCB):
+        assert self.comfy_dir is not None and self._python_cmd is not None
+
+        dependencies = ["onnx==1.16.1", "onnxruntime"]  # onnx version pinned due to #1033
+        await _execute_process("FaceID", self._pip_install(*dependencies), self.path, cb)
+
+        pyver = await get_python_version_string(self._python_cmd)
+        if is_windows and "3.11" in pyver:
+            whl_file = self._cache_dir / "insightface-0.7.3-cp311-cp311-win_amd64.whl"
+            whl_url = "https://github.com/bihailantian655/insightface_wheel/raw/main/insightface-0.7.3-cp311-cp311-win_amd64%20(1).whl"
+            await _download_cached("FaceID", network, whl_url, whl_file, cb)
+            await _execute_process("FaceID", self._pip_install(whl_file), self.path, cb)
+        else:
+            await _execute_process("FaceID", self._pip_install("insightface"), self.path, cb)
+
+    async def _install_requirements(
+        self, requirements: ModelRequirements, network: QNetworkAccessManager, cb: InternalCB
+    ):
+        if requirements is ModelRequirements.insightface:
+            await self._install_insightface(network, cb)
 
     async def install(self, callback: Callback):
         assert self.state in [ServerState.not_installed, ServerState.missing_resources] or (
@@ -244,8 +266,9 @@ class Server:
         )
         if not is_windows and self._python_cmd is None:
             raise Exception(
-                "Python not found. Please install python3, python3-venv via your package manager"
-                " and restart."
+                _(
+                    "Python not found. Please install python3, python3-venv via your package manager and restart."
+                )
             )
 
         def cb(stage: str, message: str | DownloadProgress):
@@ -267,10 +290,10 @@ class Server:
             log.error("Installation failed")
             self.state = ServerState.stopped
             self.check_install()
-            raise e
+            raise Exception(parse_common_errors(str(e)))
 
     async def download_required(self, callback: Callback):
-        models = [m.name for m in resources.required_models if m.sd_version is SDVersion.all]
+        models = [m.name for m in resources.required_models if m.arch is Arch.all]
         await self.download(models, callback)
 
     async def download(self, packages: list[str], callback: Callback):
@@ -294,11 +317,12 @@ class Server:
             )
             to_install = (r for r in all_models if r.name in packages)
             for resource in to_install:
-                target_folder = self.comfy_dir / resource.folder
-                target_file = target_folder / resource.filename
-                if not target_file.exists():
-                    target_folder.mkdir(parents=True, exist_ok=True)
-                    await _download_cached(resource.name, network, resource.url, target_file, cb)
+                if not resource.exists_in(self.path) and not resource.exists_in(self.comfy_dir):
+                    await self._install_requirements(resource.requirements, network, cb)
+                    for file in resource.files:
+                        target_file = self.path / file.path
+                        target_file.parent.mkdir(parents=True, exist_ok=True)
+                        await _download_cached(resource.name, network, file.url, target_file, cb)
         except Exception as e:
             log.exception(str(e))
             raise e
@@ -319,16 +343,17 @@ class Server:
         upgrade_comfy_dir = upgrade_dir / "ComfyUI"
         keep_paths = [
             Path("models"),
-            Path("custom_nodes", "ComfyUI_IPAdapter_plus", "models"),
             Path("custom_nodes", "comfyui_controlnet_aux", "ckpts"),
-            Path("extra_model_paths.yaml"),
         ]
         info(f"Backing up {comfy_dir} to {upgrade_comfy_dir}")
         if upgrade_comfy_dir.exists():
             raise Exception(
-                f"Backup folder {upgrade_comfy_dir} already exists! Please make sure it does not"
-                " contain any valuable data, delete it and try again."
+                _(
+                    "Backup folder {dir} already exists! Please make sure it does not contain any valuable data such as checkpoints or other models you downloaded. Then delete the folder and try again.",
+                    dir=upgrade_comfy_dir,
+                )
             )
+        upgrade_comfy_dir.parent.mkdir(exist_ok=True)
         shutil.move(comfy_dir, upgrade_comfy_dir)
         self.comfy_dir = None
         try:
@@ -341,6 +366,7 @@ class Server:
             raise e
 
         try:
+            _upgrade_models_dir(upgrade_comfy_dir / "models", self.path / "models")
             for path in keep_paths:
                 src = upgrade_comfy_dir / path
                 dst = comfy_dir / path
@@ -348,6 +374,7 @@ class Server:
                     info(f"Migrating {dst}")
                     safe_remove_dir(dst)  # Remove placeholder
                     shutil.move(src, dst)
+            _upgrade_extra_model_paths(upgrade_comfy_dir, comfy_dir)
             self.check_install()
 
             # Clean up temporary directory
@@ -356,55 +383,70 @@ class Server:
         except Exception as e:
             log.error(f"Error during upgrade: {str(e)}")
             raise Exception(
-                f"Error during model migration: {str(e)}\nSome models remain in {upgrade_comfy_dir}"
+                _("Error during model migration")
+                + f": {str(e)}\n"
+                + _("Some models remain in")
+                + f" {upgrade_comfy_dir}"
             )
 
-    async def start(self):
+    async def start(self, port: int | None = None):
         assert self.state in [ServerState.stopped, ServerState.missing_resources]
         assert self._python_cmd
+        await self._log_python_version()
 
         self.state = ServerState.starting
-        args = ["-su", "-X", "utf8", "main.py"]
-        if self.backend is ServerBackend.cpu:
-            args.append("--cpu")
-        elif self.backend is ServerBackend.directml:
-            args.append("--directml")
-        elif self.backend is ServerBackend.mps:
-            args.append("--force-fp16")
-        if settings.server_arguments:
-            args += settings.server_arguments.split(" ")
-        self._process = await asyncio.create_subprocess_exec(
-            self._python_cmd,
-            *args,
-            cwd=self.comfy_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=_process_flags,
-        )
+        last_line = ""
+        try:
+            args = ["-su", "main.py"]
+            env = {}
+            if self.backend is ServerBackend.cpu:
+                args.append("--cpu")
+            elif self.backend is ServerBackend.directml:
+                args.append("--directml")
+            if settings.server_arguments:
+                args += settings.server_arguments.split(" ")
+            if port is not None:
+                args += ["--port", str(port)]
+            if self.backend is not ServerBackend.cpu:
+                env["ONEDNN_MAX_CPU_ISA"] = "AVX2"  # workaround for #401
 
-        assert self._process.stdout is not None
-        async for line in self._process.stdout:
-            text = line.decode("utf-8").strip()
-            server_log.info(text)
-            if text.startswith("To see the GUI go to:"):
-                self.state = ServerState.running
-                self.url = text.split("http://")[-1]
-                break
+            log.info(f"Starting server with python {' '.join(args)}")
+            self._process = await create_process(
+                self._python_cmd, *args, cwd=self.comfy_dir, additional_env=env
+            )
+
+            assert self._process.stdout is not None
+            async for line in self._process.stdout:
+                text = decode_pipe_bytes(line).strip()
+                last_line = text
+                server_log.info(text)
+                if text.startswith("To see the GUI go to:"):
+                    self.state = ServerState.running
+                    self.url = text.split("http://")[-1]
+                    break
+        except Exception as e:
+            log.exception(f"Error during server start: {str(e)}")
+            if self._process is None:
+                self.state = ServerState.stopped
+                raise e
 
         if self.state != ServerState.running:
             error = "Process exited unexpectedly"
             try:
                 out, err = await asyncio.wait_for(self._process.communicate(), timeout=10)
-                server_log.info(out.decode("utf-8").strip())
-                error = err.decode("utf-8")
-                server_log.error(error)
+                server_log.error(decode_pipe_bytes(out).strip())
+                error = last_line + decode_pipe_bytes(err or out)
             except asyncio.TimeoutError:
                 self._process.kill()
+            except Exception as e:
+                log.exception(f"Error while waiting for process: {str(e)}")
+                error = str(e)
 
             self.state = ServerState.stopped
             ret = self._process.returncode
             self._process = None
-            raise Exception(f"Error during server startup: {error} [{ret}]")
+            error_msg = parse_common_errors(error, ret)
+            raise Exception(_("Error during server startup") + f": {error_msg}")
 
         self._task = asyncio.create_task(self.run())
         assert self.url is not None
@@ -412,19 +454,25 @@ class Server:
 
     async def run(self):
         assert self.state is ServerState.running
-        assert self._process and self._process.stdout and self._process.stderr
-
-        async def forward(stream: asyncio.StreamReader):
-            async for line in stream:
-                server_log.info(line.decode().strip())
+        assert self._process and self._process.stdout
 
         try:
-            await asyncio.gather(
-                forward(self._process.stdout),
-                forward(self._process.stderr),
-            )
+            async for line in self._process.stdout:
+                server_log.info(decode_pipe_bytes(line).strip())
+
+            code = await asyncio.wait_for(self._process.wait(), timeout=1)
+            if code != 0:
+                log.error(f"Server process terminated with code {self._process.returncode}")
+            elif code is not None:
+                log.info("Server process was shut down sucessfully")
+
         except asyncio.CancelledError:
             pass
+        except asyncio.TimeoutError:
+            log.warning("Server process did not terminate after the pipe was closed")
+
+        self.state = ServerState.stopped
+        self._process = None
 
     async def stop(self):
         assert self.state is ServerState.running
@@ -432,16 +480,11 @@ class Server:
             if self._process and self._task:
                 log.info("Stopping server")
                 self._process.terminate()
-                self._task.cancel()
-                await asyncio.wait_for(self._process.communicate(), timeout=5)
-                log.info(f"Server terminated with code {self._process.returncode}")
+                await asyncio.wait_for(self._task, timeout=5)
+        except asyncio.CancelledError:
+            pass
         except asyncio.TimeoutError:
             log.warning("Server did not terminate in time")
-            pass
-        finally:
-            self.state = ServerState.stopped
-            self._process = None
-            self._task = None
 
     def terminate(self):
         try:
@@ -453,7 +496,7 @@ class Server:
 
     @property
     def has_python(self):
-        return self._python_cmd is not None and self._pip_cmd is not None
+        return self._python_cmd is not None
 
     @property
     def has_comfy(self):
@@ -468,13 +511,18 @@ class Server:
 
     @property
     def can_install(self):
-        return not self.path.exists() or (self.path.is_dir() and not any(self.path.iterdir()))
+        if not self.path.exists():
+            return True
+        if self.path.is_dir():
+            return self.version == "incomplete" or not any(self.path.iterdir())
+        return False
 
     @property
     def upgrade_required(self):
         return (
             self.state is not ServerState.not_installed
             and self.version is not None
+            and self.version != "incomplete"
             and self.version != resources.version
         )
 
@@ -516,24 +564,20 @@ async def _extract_archive(name: str, archive: Path, target: Path, cb: InternalC
 
 
 async def _execute_process(name: str, cmd: list, cwd: Path, cb: InternalCB):
-    PIPE = asyncio.subprocess.PIPE
-    enc = locale.getpreferredencoding(False)
     errlog = ""
 
     cmd = [str(c) for c in cmd]
     cb(f"Installing {name}", f"Executing {' '.join(cmd)}")
-    process = await asyncio.create_subprocess_exec(
-        cmd[0], *cmd[1:], cwd=cwd, stdout=PIPE, stderr=PIPE, creationflags=_process_flags
-    )
+    process = await create_process(cmd[0], *cmd[1:], cwd=cwd, pipe_stderr=True)
 
     async def forward(stream: asyncio.StreamReader):
         async for line in stream:
-            cb(f"Installing {name}", line.decode(enc, errors="surrogateescape").strip())
+            cb(f"Installing {name}", decode_pipe_bytes(line).strip())
 
     async def collect(stream: asyncio.StreamReader):
         nonlocal errlog
         async for line in stream:
-            errlog += line.decode(enc, errors="surrogateescape")
+            errlog += decode_pipe_bytes(line)
 
     assert process.stdout and process.stderr
     await asyncio.gather(forward(process.stdout), collect(process.stderr))
@@ -541,7 +585,7 @@ async def _execute_process(name: str, cmd: list, cwd: Path, cb: InternalCB):
     if process.returncode != 0:
         if errlog == "":
             errlog = f"Process exited with code {process.returncode}"
-        raise Exception(f"Error during installation: {errlog}")
+        raise Exception(_("Error during installation") + f": {errlog}")
 
 
 async def try_install(path: Path, installer, *args):
@@ -569,7 +613,15 @@ def _prepend_file(path: Path, line: str):
         file.truncate()
 
 
-def rename_extracted_folder(name: str, path: Path, suffix: str):
+def find_missing(folders: list[Path], resources: list[ModelResource], ver: Arch | None = None):
+    return [
+        res.name
+        for res in resources
+        if (not ver or res.arch is ver) and not any(res.exists_in(f) for f in folders)
+    ]
+
+
+async def rename_extracted_folder(name: str, path: Path, suffix: str):
     if path.exists() and path.is_dir() and not any(path.iterdir()):
         path.rmdir()
     elif path.exists():
@@ -580,10 +632,17 @@ def rename_extracted_folder(name: str, path: Path, suffix: str):
         raise Exception(
             f"Error during {name} installation: folder {extracted_folder} does not exist"
         )
+    for tries in range(3):  # Because Windows, or virus scanners, or something #515
+        try:
+            extracted_folder.rename(path)
+            return
+        except Exception as e:
+            log.warning(f"Rename failed during {name} installation: {str(e)} - retrying...")
+            await asyncio.sleep(1)
     extracted_folder.rename(path)
 
 
-def safe_remove_dir(path: Path, max_size=4 * 1024 * 1024):
+def safe_remove_dir(path: Path, max_size=12 * 1024 * 1024):
     if path.is_dir():
         for p in path.rglob("*"):
             if p.is_file():
@@ -594,10 +653,103 @@ def safe_remove_dir(path: Path, max_size=4 * 1024 * 1024):
         shutil.rmtree(path, ignore_errors=True)
 
 
-async def get_python_version(python_cmd: Path):
-    enc = locale.getpreferredencoding(False)
+async def get_python_version_string(python_cmd: Path, *args: str):
     proc = await asyncio.create_subprocess_exec(
-        python_cmd, "--version", stdout=asyncio.subprocess.PIPE
+        python_cmd, *args, "--version", stdout=asyncio.subprocess.PIPE
     )
     out, _ = await proc.communicate()
-    return out.decode(enc).strip()
+    return decode_pipe_bytes(out).strip()
+
+
+async def get_python_version(python_cmd: Path, *args: str):
+    string = await get_python_version_string(python_cmd, *args)
+    matches = re.match(r"Python (\d+)\.(\d+)", string)
+    if not matches:
+        log.warning(f"Could not determine Python version: {string}")
+        return string, None, None
+    else:
+        return string, int(matches.group(1)), int(matches.group(2))
+
+
+def parse_common_errors(output: str, return_code: int | None = None):
+    if "error while attempting to bind on address" in output:
+        message_part = output.split("bind on address")[-1].strip()
+        return (
+            _("Could not bind on address")
+            + f" {message_part}. "
+            + "<a href='https://docs.interstice.cloud/common-issues#bind-address'>More information...</a>"
+        )
+
+    nvidia_driver = "Found no NVIDIA driver on your system"
+    nvidia_driver_translated = _("Found no NVIDIA driver on your system")
+    if nvidia_driver in output:
+        message_part = output.split(nvidia_driver)[-1]
+        return f"{nvidia_driver_translated} {message_part}<br>" + _(
+            "If you do not have an NVIDIA GPU, select a different backend below. Server reinstall may be required."
+        )
+
+    readtimeout_pattern = re.compile(
+        r"ReadTimeoutError: HTTPSConnectionPool\(host='(.+)'.+\): Read timed out"
+    )
+    if match := readtimeout_pattern.search(output):
+        return _(
+            "Connection to {host} timed out during download. Please make sure you have a stable internet connection and try again.",
+            host=match.group(1),
+        )
+
+    if return_code is not None:
+        return f"{output} [{return_code}]"
+    return output
+
+
+_extra_model_paths_yaml = """
+
+krita-managed:
+    base_path: ../models
+    checkpoints: checkpoints
+    clip: clip
+    clip_vision: clip_vision
+    controlnet: controlnet
+    diffusion_models: diffusion_models
+    embeddings: embeddings
+    inpaint: inpaint
+    ipadapter: ipadapter
+    loras: loras
+    style_models: style_models
+    text_encoders: text_encoders
+    upscale_models: upscale_models
+    unet: unet
+    vae: vae
+"""
+
+
+def _configure_extra_model_paths(comfy_dir: Path):
+    path = comfy_dir / "extra_model_paths.yaml"
+    example = comfy_dir / "extra_model_paths.yaml.example"
+    if not path.exists() and example.exists():
+        example.rename(path)
+    if not path.exists():
+        raise Exception(f"Could not find or create extra_model_paths.yaml in {comfy_dir}")
+    contents = path.read_text()
+    if "krita-managed" not in contents:
+        log.info(f"Extending {path}")
+        path.write_text(contents + _extra_model_paths_yaml)
+
+
+def _upgrade_extra_model_paths(src_dir: Path, dst_dir: Path):
+    src = src_dir / "extra_model_paths.yaml"
+    dst = dst_dir / "extra_model_paths.yaml"
+    if src.exists():
+        if dst.exists():
+            dst.unlink()
+        shutil.copy2(src, dst)
+        _configure_extra_model_paths(dst_dir)
+
+
+def _upgrade_models_dir(src_dir: Path, dst_dir: Path):
+    if src_dir.exists() and not dst_dir.exists():
+        log.info(f"Moving {src_dir} to {dst_dir}")
+        try:
+            shutil.move(src_dir, dst_dir)
+        except Exception as e:
+            log.error(f"Could not move model folder to new location: {str(e)}")

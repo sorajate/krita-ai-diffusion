@@ -2,13 +2,23 @@ import pytest
 import numpy as np
 from PyQt5.QtGui import QImage, qRgba
 from PyQt5.QtCore import Qt, QByteArray
+from PIL import Image as PILImage
 from ai_diffusion.image import Mask, Bounds, Extent, Image, ImageCollection
+from .config import image_dir, result_dir, reference_dir
 
 
 def test_extent_compare():
-    assert (Extent(4, 3) < Extent(4, 4)) == True
-    assert (Extent(3, 4) < Extent(4, 4)) == True
-    assert (Extent(4, 4) < Extent(4, 4)) == False
+    assert Extent(4, 3) < Extent(4, 4)
+    assert Extent(3, 4) < Extent(4, 4)
+    assert not (Extent(4, 4) < Extent(4, 4))
+
+
+def test_extent_scale_pixel_count():
+    assert Extent(4, 3).scale_to_pixel_count(12) == Extent(4, 3)
+    assert Extent(4, 3).scale_to_pixel_count(24) == Extent(6, 4)
+    assert Extent(4, 3).scale_to_pixel_count(50) == Extent(8, 6)
+    assert Extent(2, 8).scale_to_pixel_count(55) == Extent(4, 15)
+    assert Extent(10, 8).scale_to_pixel_count(60) == Extent(9, 7)
 
 
 def create_test_image(w, h):
@@ -57,7 +67,16 @@ def test_image_make_opaque():
 def test_image_to_array():
     img = create_test_image(2, 2)
     expected = np.array(
-        [[[0, 0, 0, 1], [0, 0, 1 / 255, 1]], [[0, 1 / 255, 0, 1], [0, 1 / 255, 1 / 255, 1]]],
+        [
+            [
+                [0, 0, 0, 1],
+                [1 / 255, 0, 0, 1],
+            ],
+            [
+                [0, 1 / 255, 0, 1],
+                [1 / 255, 1 / 255, 0, 1],
+            ],
+        ],
         np.float32,
     )
     assert np.all(np.isclose(img.to_array(), expected))
@@ -67,6 +86,108 @@ def test_image_compare():
     img1 = create_test_image(2, 2)
     img2 = create_test_image(2, 2)
     assert Image.compare(img1, img2) < 0.0001
+
+
+def test_image_from_pil():
+    pil_img = PILImage.new("RGBA", (2, 2), (255, 0, 0, 255))
+    img = Image.from_pil(pil_img)
+    assert img.extent == Extent(2, 2)
+    assert img.pixel(0, 0) == (255, 0, 0, 255)
+
+
+def test_image_from_packed_bytes():
+    # input has stride 3, while QImage has a minimum pixel row alignment of 4 bytes
+    data = QByteArray(b"\x00\x01\x02\x03\x04\x05")
+    img = Image.from_packed_bytes(data, Extent(3, 2), channels=1)
+    assert img.pixel(0, 0) == 0
+    assert img.pixel(1, 0) == 1
+    assert img.pixel(2, 0) == 2
+    assert img.pixel(0, 1) == 3
+    assert img.pixel(1, 1) == 4
+    assert img.pixel(2, 1) == 5
+
+
+@pytest.mark.skip("Benchmark")
+def test_image_compress_speed():
+    from PyQt5.QtGui import QImageWriter
+    from PyQt5.QtCore import QBuffer, QByteArray, QFile, QIODevice
+    from timeit import default_timer
+
+    img = Image.load("tests/images/beach_1536x1024.webp")
+
+    print("\nQImage (lossy)")
+
+    for q in range(10, 101, 10):
+        start = default_timer()
+
+        byte_array = QByteArray()
+        buffer = QBuffer(byte_array)
+        buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+        writer = QImageWriter(buffer, QByteArray(b"webp"))
+        writer.setQuality(q)
+        writer.write(img._qimage)
+        buffer.close()
+
+        end = default_timer()
+        print(f"Quality {q} | Time {end - start:.3f}s | Size {len(byte_array) // 1024} kB")
+
+        file = QFile(f"beach_1536x1024_q{q}.webp")
+        file.open(QIODevice.OpenModeFlag.WriteOnly)
+        file.write(byte_array)
+        file.close()
+
+    from PIL import Image as PILImage
+    from io import BytesIO
+
+    print("\nPillow (lossless)")
+
+    pil_img = PILImage.open("tests/images/beach_1536x1024.webp")
+    for q in range(10, 101, 10):
+        start = default_timer()
+        buffer = BytesIO()
+        pil_img.save(buffer, "WEBP", lossless=True, quality=q)
+        end = default_timer()
+        print(
+            f"Compression {q} | Time {end - start:.3f}s | Size {len(buffer.getvalue()) // 1024} kB"
+        )
+
+
+def test_image_equal():
+    red1 = Image.create(Extent(2, 2), Qt.GlobalColor.red)
+    red2 = Image.create(Extent(2, 2), Qt.GlobalColor.red)
+    green = Image.create(Extent(2, 2), Qt.GlobalColor.green)
+    assert red1 == red2
+    assert red1 != green
+
+
+def test_draw_image():
+    base = Image.create(Extent(32, 32), Qt.GlobalColor.white)
+    icon = Image.create(Extent(4, 4), Qt.GlobalColor.red)
+    base.draw_image(icon, offset=(7, 23))
+    for y in range(32):
+        for x in range(32):
+            if 7 <= x < 11 and 23 <= y < 27:
+                assert base.pixel(x, y) == (255, 0, 0, 255)
+            else:
+                assert base.pixel(x, y) == (255, 255, 255, 255)
+
+
+def test_mask_subtract():
+    lhs = Mask.load(image_dir / "mask_op_left.webp").to_image()
+    rhs = Mask.load(image_dir / "mask_op_right.webp").to_image()
+    result = Image.mask_subtract(lhs, rhs)
+    result.save(result_dir / "mask_op_subtract.png")
+    reference = Mask.load(reference_dir / "mask" / "mask_op_subtract.png").to_image()
+    assert Image.compare(result, reference) < 0.0001
+
+
+def test_mask_add():
+    lhs = Mask.load(image_dir / "mask_op_left.webp").to_image()
+    rhs = Mask.load(image_dir / "mask_op_right.webp").to_image()
+    result = Image.mask_add(lhs, rhs)
+    result.save(result_dir / "mask_op_add.png")
+    reference = Mask.load(reference_dir / "mask" / "mask_op_add.png").to_image()
+    assert Image.compare(result, reference) < 0.0001
 
 
 def test_image_collection_each():
@@ -102,7 +223,7 @@ def test_pad_bounds_min_size():
 def test_pad_square():
     bounds = Bounds(0, 0, 8, 2)
     result = Bounds.pad(bounds, 2, square=True, multiple=1)
-    assert result == Bounds(0, -2, 8, 6)
+    assert result == Bounds(-1, -2, 10, 6)
 
 
 @pytest.mark.parametrize(
@@ -115,6 +236,21 @@ def test_pad_square():
 )
 def test_clamp_bounds(input, expected):
     result = Bounds.clamp(input, Extent(4, 10))
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    "input,bounds,expected",
+    [
+        (Bounds(0, 0, 1, 2), Bounds(0, 0, 2, 2), Bounds(0, 0, 1, 2)),
+        (Bounds(0, 0, 1, 2), Bounds(0, 0, 1, 1), Bounds(0, 0, 1, 1)),
+        (Bounds(2, 4, 1, 2), Bounds(1, 4, 2, 2), Bounds(2, 4, 1, 2)),
+        (Bounds(2, 4, 7, 9), Bounds(1, 4, 2, 2), Bounds(2, 4, 1, 2)),
+        (Bounds(-1, 5, 3, 3), Bounds(0, 6, 5, 2), Bounds(0, 6, 2, 2)),
+    ],
+)
+def test_restrict_bounds(input: Bounds, bounds: Bounds, expected: Bounds):
+    result = Bounds.restrict(input, bounds)
     assert result == expected
 
 
@@ -146,6 +282,13 @@ def test_bounds_apply_crop(input, target, expected):
 def test_bounds_minimum_size(input, min_size, max_extent, expected):
     result = Bounds.minimum_size(input, min_size, max_extent)
     assert result == expected
+
+
+def test_bounds_expand():
+    bounds = Bounds(1, 2, 4, 5)
+    other = Bounds(3, 0, 4, 4)
+    result = Bounds.expand(bounds, other)
+    assert result == Bounds(1, 0, 6, 7)
 
 
 def test_mask_to_image():

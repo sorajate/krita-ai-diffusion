@@ -1,4 +1,4 @@
-from ..model import Model, Workspace
+from ..model import Workspace
 from ..root import root
 
 
@@ -8,6 +8,10 @@ def generate():
             model.generate()
         elif model.workspace is Workspace.upscaling:
             model.upscale_image()
+        elif model.workspace is Workspace.live:
+            model.generate_live()
+        elif model.workspace is Workspace.animation:
+            model.animation.generate()
 
 
 def cancel_active():
@@ -25,10 +29,30 @@ def cancel_all():
         model.cancel(active=True, queued=True)
 
 
+def toggle_preview():
+    if model := root.model_for_active_document():
+        model.jobs.toggle_selection()
+
+
 def apply():
     if model := root.model_for_active_document():
-        if model.can_apply_result:
-            model.apply_current_result()
+        if model.workspace is Workspace.generation and model.jobs.selection is not None:
+            model.apply_generated_result(*model.jobs.selection)
+        elif model.workspace is Workspace.live:
+            model.live.apply_result()
+
+
+def apply_alternative():
+    if model := root.model_for_active_document():
+        if model.workspace is Workspace.live:
+            model.live.apply_result(layer_only=True)
+        else:
+            apply()
+
+
+def create_region():
+    if model := root.model_for_active_document():
+        model.regions.create_region(group=model.workspace is not Workspace.live)
 
 
 def set_workspace(workspace: Workspace):

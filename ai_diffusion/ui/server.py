@@ -2,7 +2,6 @@ from __future__ import annotations
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-from itertools import accumulate
 from PyQt5.QtCore import Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import (
@@ -23,14 +22,15 @@ from PyQt5.QtWidgets import (
 )
 from krita import Krita
 
-from ..settings import Settings, settings
-from ..style import SDVersion
+from ..settings import Settings, ServerMode, settings
+from ..style import Arch
 from ..resources import ModelResource, CustomNode
 from ..server import Server, ServerBackend, ServerState
 from ..connection import ConnectionState
 from ..root import root
+from ..localization import translate as _
 from .. import eventloop, resources, server, util
-from .theme import add_header, set_text_clipped, green, grey, red, yellow, highlight
+from .theme import SignalBlocker, add_header, set_text_clipped, green, grey, red, yellow, highlight
 
 
 class PackageState(Enum):
@@ -52,7 +52,7 @@ class PackageGroupWidget(QWidget):
     _items: list[PackageItem]
     _status: QLabel
     _desc: Optional[QLabel] = None
-    _workload = SDVersion.all
+    _workload = Arch.all
     _is_checkable = False
 
     changed = pyqtSignal()
@@ -88,13 +88,13 @@ class PackageGroupWidget(QWidget):
         self._layout.addWidget(self._status, 0, 1)
 
         if description:
-            self._desc = QLabel(self)
-            self._desc.setText(description)
-            self._desc.setContentsMargins(20, 0, 0, 0)
-            self._desc.setWordWrap(True)
-            self._desc.setTextFormat(Qt.TextFormat.RichText)
-            self._desc.setOpenExternalLinks(True)
-            self._layout.addWidget(self._desc, 1, 0, 1, 2)
+            desc = self._desc = QLabel(self)
+            desc.setText(description)
+            desc.setContentsMargins(20, 0, 0, 0)
+            desc.setWordWrap(True)
+            desc.setTextFormat(Qt.TextFormat.RichText)
+            desc.setOpenExternalLinks(True)
+            self._layout.addWidget(desc, 1, 0, 1, 2)
 
         self._is_checkable = is_checkable
         self._items = [self.add_item(p, initial) for p in packages]
@@ -117,7 +117,7 @@ class PackageGroupWidget(QWidget):
         item.label = QLabel(self._package_name(package), self)
         item.label.setContentsMargins(20, 0, 0, 0)
         if self.is_checkable:
-            item.status = QCheckBox("Install", self)
+            item.status = QCheckBox(_("Install"), self)
             item.status.setChecked(initial in [PackageState.selected, PackageState.installed])
             item.status.toggled.connect(self._handle_checkbox_toggle)
         else:
@@ -143,28 +143,31 @@ class PackageGroupWidget(QWidget):
     def _update(self):
         for item in self._items:
             if item.state is PackageState.installed:
-                item.status.setText("Installed")
+                item.status.setText(_("Installed"))
                 item.status.setStyleSheet(f"color:{green}")
             elif item.state is PackageState.available:
-                item.status.setText("Not installed")
+                item.status.setText(_("Not installed"))
                 item.status.setStyleSheet("")
             if self.is_checkable:
                 self._update_workload(item)
                 if item.state is PackageState.selected:
-                    item.status.setText("Not installed")
+                    item.status.setText(_("Not installed"))
                     item.status.setStyleSheet("")
                 elif item.state is PackageState.disabled:
-                    item.status.setText("Workload not selected")
+                    item.status.setText(_("Workload not selected"))
                     item.status.setStyleSheet(f"color:{grey}")
-                item.status.setChecked(
-                    item.state in [PackageState.selected, PackageState.installed]
-                )
-                item.status.setEnabled(item.state is not PackageState.disabled)
+                with SignalBlocker(item.status):
+                    item.status.setChecked(
+                        item.state in [PackageState.selected, PackageState.installed]
+                    )
+                    item.status.setEnabled(item.state is not PackageState.disabled)
         self._update_status()
 
     def _update_workload(self, item: PackageItem):
-        enabled = not isinstance(item.package, ModelResource) or SDVersion.match(
-            self._workload, item.package.sd_version
+        enabled = (
+            not isinstance(item.package, ModelResource)
+            or Arch.match(self._workload, item.package.arch)
+            or item.package.arch not in [Arch.sd15, Arch.sdxl]
         )
         if not enabled and item.state in [PackageState.selected, PackageState.available]:
             item.state = PackageState.disabled
@@ -188,7 +191,7 @@ class PackageGroupWidget(QWidget):
         return self._workload
 
     @workload.setter
-    def workload(self, workload: SDVersion):
+    def workload(self, workload: Arch):
         self._workload = workload
         self._update()
 
@@ -203,18 +206,20 @@ class PackageGroupWidget(QWidget):
     def _update_status(self):
         available = sum(item.state is PackageState.available for item in self._items)
         if all(item.state is PackageState.installed for item in self._items):
-            self._status.setText("All installed")
+            self._status.setText(_("All installed"))
             self._status.setStyleSheet(f"color:{green}")
         elif self.is_checkable:
             selected = sum(item.state is PackageState.selected for item in self._items)
             if selected > 0:
-                self._status.setText(f"{selected} of {selected + available} packages selected")
+                self._status.setText(
+                    f"{selected} of {selected + available} " + _("packages selected")
+                )
                 self._status.setStyleSheet(f"color:{yellow}")
             else:
-                self._status.setText(f"{available} packages available")
+                self._status.setText(f"{available} " + _("packages available"))
                 self._status.setStyleSheet(f"color:{grey}")
         else:
-            self._status.setText(f"{available} packages require installation")
+            self._status.setText(f"{available} " + _("packages require installation"))
             self._status.setStyleSheet(f"color:{yellow}")
 
     def _handle_checkbox_toggle(self):
@@ -279,8 +284,9 @@ class ServerWidget(QWidget):
         self._launch_button.setMinimumHeight(35)
         self._launch_button.clicked.connect(self._launch)
 
-        open_log_button = QLabel(f"<a href='file://{util.log_path}'>View log files</a>", self)
-        open_log_button.setToolTip(str(util.log_path))
+        anchor = _("View log files")
+        open_log_button = QLabel(f"<a href='file://{util.log_dir}'>{anchor}</a>", self)
+        open_log_button.setToolTip(str(util.log_dir))
         open_log_button.linkActivated.connect(self._open_logs)
 
         status_layout = QVBoxLayout()
@@ -312,56 +318,77 @@ class ServerWidget(QWidget):
         layout.addWidget(scroll, 1)
 
         self._required_group = PackageGroupWidget(
-            "Core components",
-            ["Python", "ComfyUI", "Custom nodes", "Required models"],
+            _("Core components"),
+            ["Python", "ComfyUI", _("Custom nodes"), _("Required models")],
             is_expanded=False,
             parent=self,
         )
         package_layout.addWidget(self._required_group)
 
         self._workload_group = PackageGroupWidget(
-            "Workloads",
-            ["Stable Diffusion 1.5", "Stable Diffusion XL"],
+            _("Workloads"),
+            [_("Stable Diffusion 1.5"), _("Stable Diffusion XL")],
             description=(
-                "Choose one or both Stable Diffusion versions to work with. <a"
-                " href='https://github.com/Acly/krita-ai-diffusion/tree/main/doc/sd-versions.md'>Read"
-                " more about workloads.</a>"
+                _("Choose a Diffusion base model to install its basic requirements.")
+                + " <a href='https://docs.interstice.cloud/base-models'>"
+                + _("Read more about workloads.")
+                + "</a>"
             ),
             is_checkable=True,
             parent=self,
         )
-        self._workload_group.changed.connect(self.update)
+        self._workload_group.values = [PackageState.available, PackageState.selected]
+        self._workload_group.changed.connect(self.update_ui)
         package_layout.addWidget(self._workload_group)
 
+        optional_models = resources.default_checkpoints + resources.optional_models
         self._packages = {
-            "checkpoints": PackageGroupWidget(
-                "Recommended checkpoints",
-                resources.default_checkpoints,
-                description=(
-                    "At least one Stable Diffusion checkpoint is required. Below are some popular"
-                    " choices, more can be found online."
-                ),
-                is_checkable=True,
-                initial=PackageState.available if self._server.has_comfy else PackageState.selected,
-                parent=self,
-            ),
             "upscalers": PackageGroupWidget(
-                "Upscalers (super-resolution)",
+                _("Upscalers (super-resolution)"),
                 resources.upscale_models,
                 is_checkable=True,
                 parent=self,
             ),
-            "control": PackageGroupWidget(
-                "Control extensions", resources.optional_models, is_checkable=True, parent=self
+            "sd15": PackageGroupWidget(
+                _("Stable Diffusion 1.5 models"),
+                [m for m in optional_models if m.arch is Arch.sd15],
+                description=_("Select at least one diffusion model. Control models are optional."),
+                is_checkable=True,
+                is_expanded=False,
+                parent=self,
+            ),
+            "sdxl": PackageGroupWidget(
+                _("Stable Diffusion XL models"),
+                [m for m in optional_models if m.arch is Arch.sdxl],
+                description=_("Select at least one diffusion model. Control models are optional."),
+                is_checkable=True,
+                parent=self,
+            ),
+            "illu": PackageGroupWidget(
+                _("Illustrious/NoobAI XL models"),
+                [m for m in optional_models if m.arch in [Arch.illu, Arch.illu_v]],
+                description=_("Select at least one diffusion model. Control models are optional."),
+                is_checkable=True,
+                is_expanded=False,
+                parent=self,
             ),
         }
-        for group in ["checkpoints", "upscalers", "control"]:
-            self._packages[group].changed.connect(self.update)
+        # Pre-select a recommended set of models if the server hasn't been installed yet
+        if not self._server.has_comfy and self.selected_workload in [Arch.all, Arch.sdxl]:
+            sdxl_packages = self._packages["sdxl"]
+            sdxl_packages.workload = Arch.sdxl
+            state = [PackageState.selected for _ in sdxl_packages.values]
+            state[-1] = PackageState.available  # Face model is optional
+            sdxl_packages.values = state
+
+        for group in ["upscalers", "sd15", "sdxl", "illu"]:
+            self._packages[group].changed.connect(self.update_ui)
             package_layout.addWidget(self._packages[group])
 
         package_layout.addStretch()
 
-        self.update()
+        root.connection.state_changed.connect(self.update_ui)
+        self.update_ui()
         self.update_required()
 
     def _change_location(self):
@@ -370,25 +397,30 @@ class ServerWidget(QWidget):
             self._server.check_install()
             settings.server_path = self._location_edit.text()
             settings.save()
-            self.update()
+            self.update_ui()
             self.update_required()
 
     def _select_location(self):
         path = self._server.path
-        if not self._server.path.exists():
+        if not path.exists():
+            path = path.parent
+        if not path.exists():
             path = Path(Settings._server_path.default)
             path.mkdir(parents=True, exist_ok=True)
         path = QFileDialog.getExistingDirectory(
-            self, "Select Directory", str(path), QFileDialog.ShowDirsOnly
+            self, _("Select Directory"), str(path), QFileDialog.ShowDirsOnly
         )
         if path:
-            self._location_edit.setText(path)
+            path = Path(path)
+            if path != Path(Settings._server_path.default) and not (path / "ComfyUI").exists():
+                path = path / "ComfyUI"
+            self._location_edit.setText(str(path))
 
     def _change_backend(self):
         backends = ServerBackend.supported()
         try:
             backend = backends[self._backend_select.currentIndex()]
-        except:
+        except Exception:
             backend = backends[0]
         if settings.server_backend != backend:
             self._server.backend = backend
@@ -396,7 +428,7 @@ class ServerWidget(QWidget):
             settings.save()
 
     def _open_logs(self):
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(util.log_path)))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(util.log_dir)))
 
     def _launch(self):
         self._error = ""
@@ -411,29 +443,29 @@ class ServerWidget(QWidget):
 
     async def _start(self):
         self._launch_button.setEnabled(False)
-        self._status_label.setText("Starting server...")
+        self._status_label.setText(_("Starting server..."))
         self._status_label.setStyleSheet("color:orange;font-weight:bold")
         try:
             url = await self._server.start()
-            self.update()
-            self._status_label.setText("Server running - Connecting...")
+            self.update_ui()
+            self._status_label.setText(_("Server running - Connecting..."))
             self._status_label.setStyleSheet(f"color:{yellow};font-weight:bold")
-            await root.connection._connect(url)
+            await root.connection._connect(url, ServerMode.managed)
         except Exception as e:
-            self._error = str(e)
-        self.update()
+            self.show_error(str(e))
+        self.update_ui()
 
     async def _stop(self):
         self._launch_button.setEnabled(False)
-        self._status_label.setText("Stopping server...")
+        self._status_label.setText(_("Stopping server..."))
         self._status_label.setStyleSheet(f"color:{yellow};font-weight:bold")
         try:
             if root.connection.state is ConnectionState.connected:
                 await root.connection.disconnect()
             await self._server.stop()
         except Exception as e:
-            self._error = str(e)
-        self.update()
+            self.show_error(str(e))
+        self.update_ui()
 
     async def _install(self):
         try:
@@ -450,13 +482,13 @@ class ServerWidget(QWidget):
             models_to_install = self.update_optional()
             if len(models_to_install) > 0:
                 await self._server.download(models_to_install, self._handle_progress)
-            self.update()
+            self.update_ui()
 
             await self._start()
 
         except Exception as e:
-            self._error = str(e)
-        self.update()
+            self.show_error(str(e))
+        self.update_ui()
 
     async def _upgrade(self):
         try:
@@ -465,12 +497,12 @@ class ServerWidget(QWidget):
 
             await self._prepare_for_install()
             await self._server.upgrade(self._handle_progress)
-            self.update()
+            self.update_ui()
             await self._start()
 
         except Exception as e:
-            self._error = str(e)
-        self.update()
+            self.show_error(str(e))
+        self.update_ui()
 
     async def _prepare_for_install(self):
         if self._server.state is ServerState.running:
@@ -505,76 +537,86 @@ class ServerWidget(QWidget):
             self._progress_bar.setValue(0)
             self._progress_bar.setTextVisible(False)
 
-    def update(self):
+    def update_ui(self):
         self._location_edit.setText(settings.server_path)
         backends = ServerBackend.supported()
         try:
             index = backends.index(settings.server_backend)
-        except:
+        except Exception:
             index = 0
         self._backend_select.setCurrentIndex(index)
         self._progress_bar.setVisible(False)
         self._progress_info.setVisible(False)
         self._backend_select.setVisible(True)
         self._launch_button.setEnabled(True)
+        self._location_edit.setEnabled(True)
 
         state = self._server.state
         if state is ServerState.not_installed:
-            self._status_label.setText("Server is not installed")
+            self._status_label.setText(_("Server is not installed"))
             self._status_label.setStyleSheet(f"color:{red};font-weight:bold")
         elif state is ServerState.missing_resources:
-            self._status_label.setText("Server is missing required components")
+            self._status_label.setText(_("Server is missing required components"))
             self._status_label.setStyleSheet(f"color:{red};font-weight:bold")
         elif state is ServerState.installing:
+            self._location_edit.setEnabled(False)
             self._progress_bar.setVisible(True)
             self._progress_info.setVisible(True)
             self._backend_select.setVisible(False)
             self._launch_button.setEnabled(False)
         elif self._server.upgrade_required:
             self._status_label.setText(
-                f"Upgrade required: v{self._server.version} -> v{resources.version}"
+                _("Upgrade required") + f": v{self._server.version} -> v{resources.version}"
             )
             self._status_label.setStyleSheet(f"color:{yellow};font-weight:bold")
-            self._launch_button.setText("Upgrade")
+            self._launch_button.setText(_("Upgrade"))
             self._launch_button.setEnabled(True)
         elif state is ServerState.stopped:
-            self._status_label.setText("Server stopped")
+            self._status_label.setText(_("Server stopped"))
             self._status_label.setStyleSheet(f"color:{red};font-weight:bold")
-            self._launch_button.setText("Launch")
+            self._launch_button.setText(_("Launch"))
         elif state is ServerState.starting:
-            self._status_label.setText("Starting server...")
+            self._status_label.setText(_("Starting server..."))
             self._status_label.setStyleSheet(f"color:{yellow};font-weight:bold")
-            self._launch_button.setText("Launch")
+            self._launch_button.setText(_("Launch"))
             self._launch_button.setEnabled(False)
+            self._location_edit.setEnabled(False)
         elif state is ServerState.running:
             connection_state = root.connection.state
             if connection_state is ConnectionState.disconnected:
-                self._status_label.setText("Server running - Disconnected")
+                self._status_label.setText(_("Server running - Disconnected"))
                 self._status_label.setStyleSheet(f"color:{grey};font-weight:bold")
             elif connection_state is ConnectionState.connecting:
-                self._status_label.setText("Server running - Connecting...")
+                self._status_label.setText(_("Server running - Connecting..."))
                 self._status_label.setStyleSheet(f"color:{yellow};font-weight:bold")
             elif connection_state is ConnectionState.connected:
-                self._status_label.setText("Server running - Connected")
+                self._status_label.setText(_("Server running - Connected"))
                 self._status_label.setStyleSheet(f"color:{green};font-weight:bold")
             elif connection_state is ConnectionState.error:
+                text = _("Server running - Connection error")
                 error = root.connection.error or "Unknown error"
-                self._status_label.setText(f"<b>Server running - Connection error:</b> {error}")
+                self._status_label.setText(f"<b>{text}:</b> {error}")
                 self._status_label.setStyleSheet(f"color:{red}")
-            self._launch_button.setText("Stop")
+            self._launch_button.setText(_("Stop"))
+            self._location_edit.setEnabled(False)
 
         if self.requires_install:
-            self._launch_button.setText("Install")
+            self._launch_button.setText(_("Install"))
             if not self._server.version and not self._server.can_install:
                 self._status_label.setText(
-                    "Invalid location: directory is not empty, but no previous installation was"
-                    " found"
+                    _(
+                        "Invalid location: directory is not empty, but no previous installation was found"
+                    )
                 )
                 self._status_label.setStyleSheet(f"color:{red};font-weight:bold")
                 self._launch_button.setEnabled(False)
             else:
                 self._launch_button.setEnabled(True)
 
+        self.show_error(self._error)
+
+    def show_error(self, error: str):
+        self._error = error
         if self._error:
             self._status_label.setText(f"<b>Error:</b> {self._error}")
             self._status_label.setStyleSheet(f"color:{red}")
@@ -586,7 +628,7 @@ class ServerWidget(QWidget):
         has_missing_models = any(
             model.name in self._server.missing_resources
             for model in resources.required_models
-            if model.sd_version is SDVersion.all
+            if model.arch is Arch.all
         )
         installed_status = [
             self._server.has_python,
@@ -598,12 +640,10 @@ class ServerWidget(QWidget):
 
     def update_optional(self):
         workloads = [
-            [m for m in resources.required_models if m.sd_version is SDVersion.sd15],
-            [m for m in resources.required_models if m.sd_version is SDVersion.sdxl],
+            [m for m in resources.required_models if m.arch is Arch.sd15],
+            [m for m in resources.required_models if m.arch is Arch.sdxl],
         ]
         self._workload_group.set_installed([self._server.all_installed(w) for w in workloads])
-        if all(state is PackageState.available for state in self._workload_group.values):
-            self._workload_group.values = [PackageState.selected, PackageState.available]
         to_install = [
             m.name
             for workload, state in zip(workloads, self._workload_group.values)
@@ -635,9 +675,9 @@ class ServerWidget(QWidget):
             for state in self._workload_group.values
         ]
         if all(selected_or_installed):
-            return SDVersion.all
+            return Arch.all
         if selected_or_installed[0]:
-            return SDVersion.sd15
+            return Arch.sd15
         if selected_or_installed[1]:
-            return SDVersion.sdxl
-        assert False, "No workload selected!"
+            return Arch.sdxl
+        return Arch.auto

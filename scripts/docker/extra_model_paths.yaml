@@ -1,5 +1,5 @@
 runpod:
-    base_path: /models
+    base_path: /workspace/models
 
     checkpoints: checkpoints
     clip_vision: clip_vision
@@ -10,3 +10,8 @@ runpod:
     embeddings: embeddings
     hypernetworks: hypernetworks
     controlnet: controlnet
+    ipadapter: ipadapter
+    inpaint: inpaint
+    style_models: style_models
+    diffusion_models: diffusion_models
+    text_encoders: text_encoders

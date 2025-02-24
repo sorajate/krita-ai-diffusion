@@ -1,25 +1,29 @@
 from __future__ import annotations
+from dataclasses import dataclass
 import os
 import json
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Any
+from typing import NamedTuple, Optional, Any
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from . import util
+from .util import is_macos, is_windows, user_data_dir, client_logger as log
+from .util import encode_json, read_json_with_comments
+from .localization import translate as _
 
 
 class ServerMode(Enum):
     undefined = -1
     managed = 0
     external = 1
+    cloud = 2
 
 
 class ServerBackend(Enum):
-    cpu = ("Run on CPU", True)
-    cuda = ("Use CUDA (NVIDIA GPU)", not util.is_macos)
-    mps = ("Use MPS (Metal Performance Shader)", util.is_macos)
-    directml = ("Use DirectML (GPU)", util.is_windows)
+    cpu = (_("Run on CPU"), True)
+    cuda = (_("Use CUDA (NVIDIA GPU)"), not is_macos)
+    mps = (_("Use MPS (Metal Performance Shader)"), is_macos)
+    directml = (_("Use DirectML (GPU)"), is_windows)
 
     @staticmethod
     def supported():
@@ -27,19 +31,42 @@ class ServerBackend(Enum):
 
     @staticmethod
     def default():
-        if util.is_macos:
+        if is_macos:
             return ServerBackend.mps
         else:
             return ServerBackend.cuda
 
 
+class ApplyBehavior(Enum):
+    replace = 0
+    layer = 1
+    layer_group = 2
+    layer_hide_below = 3
+    transparency_mask = 4
+
+
 class PerformancePreset(Enum):
-    auto = "Automatic"
-    cpu = "CPU"
-    low = "GPU low (less than 6GB)"
-    medium = "GPU medium (6GB to 12GB)"
-    high = "GPU high (more than 12GB)"
-    custom = "Custom"
+    auto = _("Automatic")
+    cpu = _("CPU")
+    low = _("GPU low (up to 6GB)")
+    medium = _("GPU medium (6GB to 12GB)")
+    high = _("GPU high (more than 12GB)")
+    cloud = _("Cloud")
+    custom = _("Custom")
+
+
+class PerformancePresetSettings(NamedTuple):
+    batch_size: int = 4
+    resolution_multiplier: float = 1.0
+    max_pixel_count: int = 6
+
+
+@dataclass
+class PerformanceSettings:
+    batch_size: int = 4
+    resolution_multiplier: float = 1.0
+    max_pixel_count: int = 6
+    dynamic_caching: bool = False
 
 
 class Setting:
@@ -60,118 +87,223 @@ class Setting:
 
 
 class Settings(QObject):
-    default_path = Path(__file__).parent / "settings.json"
+    default_path = user_data_dir / "settings.json"
+
+    language: str
+    _language = Setting(
+        _("Language"),
+        "en",
+        _("Interface language used by the plugin - requires restart!"),
+    )
+
+    auto_update: bool
+    _auto_update = Setting(
+        _("Enable Automatic Updates"), True, _("Check for new versions of the plugin on startup")
+    )
 
     server_mode: ServerMode
     _server_mode = Setting(
-        "Server Management",
+        _("Server Management"),
         ServerMode.undefined,
-        "To generate images, the plugin connects to a ComfyUI server",
+        _("To generate images, the plugin connects to a ComfyUI server"),
     )
+
+    access_token: str
+    _access_token = Setting(_("Cloud Access Token"), "")
 
     server_path: str
     _server_path = Setting(
-        "Server Path",
-        str(Path(__file__).parent / ".server"),
-        "Directory where ComfyUI will be installed. At least 10GB of free disk space is required"
-        " for a full installation.",
+        _("Server Path"),
+        str(user_data_dir / "server"),
+        _(
+            "Directory where ComfyUI will be installed. At least 10GB of free disk space is required for a minimal installation."
+        ),
     )
 
     server_url: str
     _server_url = Setting(
-        "Server URL",
+        _("Server URL"),
         "127.0.0.1:8188",
-        "URL used to connect to a running ComfyUI server. Default is 127.0.0.1:8188 (local).",
+        _("URL used to connect to a running ComfyUI server. Default is 127.0.0.1:8188 (local)."),
     )
 
     server_backend: ServerBackend
-    _server_backend = Setting("Server Backend", ServerBackend.default())
+    _server_backend = Setting(_("Server Backend"), ServerBackend.default())
 
     server_arguments: str
     _server_arguments = Setting(
-        "Server Arguments", "", "Additional command line arguments passed to the server"
+        _("Server Arguments"), "", _("Additional command line arguments passed to the server")
     )
 
     selection_grow: int
     _selection_grow = Setting(
-        "Selection Grow", 7, "Selection area is expanded by a fraction of its size"
+        _("Selection Grow"), 5, _("Selection area is expanded by a fraction of its size")
     )
 
     selection_feather: int
     _selection_feather = Setting(
-        "Selection Feather", 7, "The border is blurred by a fraction of selection size"
+        _("Selection Feather"), 5, _("The border is blurred by a fraction of selection size")
     )
 
     selection_padding: int
     _selection_padding = Setting(
-        "Selection Padding", 7, "Minimum additional padding around the selection area"
+        _("Selection Padding"), 7, _("Minimum additional padding around the selection area")
     )
 
-    fixed_seed: bool
-    _fixed_seed = Setting("Use Fixed Seed", False, "Fixes the random seed to a specific value")
+    nsfw_filter: float
+    _nsfw_filter = Setting(
+        _("NSFW Filter"), 0.0, _("Attempt to filter out images with explicit content")
+    )
 
-    random_seed: str
-    _random_seed = Setting(
-        "Random Seed", "0", "Random number to produce different results with each generation"
+    new_seed_after_apply: bool
+    _new_seed_after_apply = Setting(
+        _("Live: New Seed after Apply"),
+        False,
+        _("Pick a new seed after copying the result to the canvas in Live mode"),
+    )
+
+    prompt_translation: str
+    _prompt_translation = Setting(
+        _("Prompt Translation"),
+        "",
+        _("Translate text prompts from the selected language to English"),
     )
 
     prompt_line_count: int
     _prompt_line_count = Setting(
-        "Prompt Line Count", 2, "Size of the text editor for image descriptions"
+        _("Prompt Line Count"), 2, _("Size of the text editor for image descriptions")
     )
+
+    prompt_line_count_live: int
+    _prompt_line_count_live = Setting("Prompt Line Count (Live)", 2)
 
     show_negative_prompt: bool
     _show_negative_prompt = Setting(
-        "Negative Prompt", False, "Show text editor to describe things to avoid"
+        _("Negative Prompt"), False, _("Show text editor to describe things to avoid")
     )
 
-    show_control_end: bool
-    _show_control_end = Setting("Control ending step", False, "Show control ending step ratio")
+    auto_preview: bool
+    _auto_preview = Setting(
+        _("Auto Preview"), True, _("Automatically preview the first generated result on the canvas")
+    )
+
+    show_steps: bool
+    _show_steps = Setting(
+        _("Show Steps"), False, _("Display the number of steps to be evaluated in the weights box.")
+    )
+
+    tag_files: list[str]
+    _tag_files = Setting(
+        _("Tag Auto-Completion"),
+        list(),
+        _("Enable text completion for tags from the selected files"),
+    )
+
+    apply_behavior: ApplyBehavior
+    _apply_behavior = Setting(
+        _("Apply Behavior"),
+        ApplyBehavior.layer_hide_below,
+        _("Choose how result images are applied to the canvas (generation workspaces)"),
+    )
+
+    apply_behavior_live: ApplyBehavior
+    _apply_behavior_live = Setting(
+        "Apply Behavior (Live)",
+        ApplyBehavior.replace,
+        "Choose how result images are applied to the canvas in Live mode",
+    )
+
+    show_builtin_styles: bool
+    _show_builtin_styles = Setting(_("Show pre-installed styles"), True)
 
     history_size: int
     _history_size = Setting(
-        "History Size", 1000, "Main memory (RAM) used to keep the history of generated images"
+        _("Active History Size"),
+        1000,
+        _("Main memory (RAM) used for the history of generated images"),
+    )
+
+    history_storage: int
+    _history_storage = Setting(
+        _("Stored History Size"),
+        20,
+        _("Memory used to store generated images in .kra files on disk"),
     )
 
     performance_preset: PerformancePreset
     _performance_preset = Setting(
-        "Performance Preset",
+        _("Performance Preset"),
         PerformancePreset.auto,
-        "Configures performance settings to match available hardware.",
+        _("Configures performance settings to match available hardware."),
     )
 
     batch_size: int
     _batch_size = Setting(
-        "Maximum Batch Size",
+        _("Maximum Batch Size"),
         4,
-        "Increase efficiency by generating multiple images at once",
+        _("Increase efficiency by generating multiple images at once"),
     )
 
-    diffusion_tile_size: int
-    _diffusion_tile_size = Setting(
-        "Diffusion Tile Size",
-        2048,
-        "Resolution threshold at which diffusion is split up into multiple tiles",
+    resolution_multiplier: float
+    _resolution_multiplier = Setting(
+        _("Resolution Multiplier"),
+        1.0,
+        _(
+            "Scaling factor for generation. Values below 1.0 improve performance for high resolution canvas."
+        ),
+    )
+
+    max_pixel_count: int
+    _max_pixel_count = Setting(
+        _("Maximum Pixel Count"),
+        6,
+        _("Maximum resolution to generate images at, in megapixels (FullHD ~ 2MP, 4k ~ 8MP)."),
+    )
+
+    dynamic_caching: bool
+    _dynamic_caching = Setting(
+        _("Dynamic Caching"),
+        False,
+        _("Re-use outputs of previous steps (First Block Cache) to speed up generation."),
     )
 
     _performance_presets = {
-        PerformancePreset.cpu: {
-            "batch_size": 1,
-            "diffusion_tile_size": 4096,
-        },
-        PerformancePreset.low: {
-            "batch_size": 2,
-            "diffusion_tile_size": 1024,
-        },
-        PerformancePreset.medium: {
-            "batch_size": 4,
-            "diffusion_tile_size": 2048,
-        },
-        PerformancePreset.high: {
-            "batch_size": 8,
-            "diffusion_tile_size": 4096,
-        },
+        PerformancePreset.cpu: PerformancePresetSettings(
+            batch_size=1,
+            resolution_multiplier=1.0,
+            max_pixel_count=2,
+        ),
+        PerformancePreset.low: PerformancePresetSettings(
+            batch_size=2,
+            resolution_multiplier=1.0,
+            max_pixel_count=2,
+        ),
+        PerformancePreset.medium: PerformancePresetSettings(
+            batch_size=4,
+            resolution_multiplier=1.0,
+            max_pixel_count=6,
+        ),
+        PerformancePreset.high: PerformancePresetSettings(
+            batch_size=6,
+            resolution_multiplier=1.0,
+            max_pixel_count=8,
+        ),
+        PerformancePreset.cloud: PerformancePresetSettings(
+            batch_size=8,
+            resolution_multiplier=1.0,
+            max_pixel_count=6,
+        ),
     }
+
+    debug_dump_workflow: bool
+    _debug_dump_workflow = Setting(
+        _("Dump Workflow"),
+        False,
+        _("Write latest ComfyUI prompt to the log folder for test & debug"),
+    )
+
+    document_defaults: dict[str, Any]
+    _document_defaults = Setting(_("Document Defaults"), {}, _("Recently used document settings"))
 
     # Folder where intermediate images are stored for debug purposes (default: None)
     debug_image_folder = os.environ.get("KRITA_AI_DIFFUSION_DEBUG_IMAGE")
@@ -182,7 +314,7 @@ class Settings(QObject):
 
     def __init__(self):
         super().__init__()
-        self.restore()
+        self.restore(init=True)
 
     def __getattr__(self, name: str):
         if name in self._values:
@@ -191,44 +323,64 @@ class Settings(QObject):
 
     def __setattr__(self, name: str, value):
         if name in self._values:
-            self._values[name] = value
-            self.changed.emit(name, value)
-            if name == "performance_preset":
-                self.apply_performance_preset(value)
+            if self._values[name] != value:
+                self._values[name] = value
+                if name != "document_defaults":
+                    self.changed.emit(name, value)
+                if name == "performance_preset":
+                    self.apply_performance_preset(value)
         else:
             object.__setattr__(self, name, value)
 
-    def restore(self):
+    def restore(self, init=False):
         self.__dict__["_values"] = {
             k[1:]: v.default for k, v in Settings.__dict__.items() if isinstance(v, Setting)
         }
+        if not init:
+            self.server_mode = ServerMode.managed
 
     def save(self, path: Optional[Path] = None):
-        path = self.default_path if path is None else path
+        path = self.default_path or path
         with open(path, "w") as file:
-            file.write(json.dumps(self._values, default=util.encode_json, indent=4))
+            file.write(json.dumps(self._values, default=encode_json, indent=4))
 
     def load(self, path: Optional[Path] = None):
-        path = self.default_path if path is None else path
+        path = self.default_path or path
+        self._migrate_legacy_settings(path)
         if not path.exists():
             self.save()  # create new file with defaults
             return
-        with open(path, "r") as file:
-            contents = json.loads(file.read())
+
+        log.info(f"Loading settings from {path}")
+        try:
+            contents = read_json_with_comments(path)
             for k, v in contents.items():
-                setting = getattr(Settings, f"_{k}", None)
+                setting: Setting | None = getattr(Settings, f"_{k}", None)
                 if setting is not None:
                     if isinstance(setting.default, Enum):
                         self._values[k] = setting.str_to_enum(v)
                     elif isinstance(setting.default, type(v)):
                         self._values[k] = v
                     else:
-                        raise Exception(f"{v} is not a valid value for '{k}'")
+                        log.error(f"{path}: {v} is not a valid value for '{k}'")
+                        self._values[k] = setting.default
+        except Exception as e:
+            log.error(f"Failed to load settings: {e}")
 
     def apply_performance_preset(self, preset: PerformancePreset):
         if preset not in [PerformancePreset.custom, PerformancePreset.auto]:
-            for k, v in self._performance_presets[preset].items():
+            for k, v in self._performance_presets[preset]._asdict().items():
                 self._values[k] = v
+
+    def _migrate_legacy_settings(self, path: Path):
+        if path == self.default_path:
+            legacy_path = Path(__file__).parent / "settings.json"
+            if legacy_path.exists() and not path.exists():
+                try:
+                    legacy_path.rename(path)
+                    log.info(f"Migrated settings from {legacy_path} to {path}")
+                except Exception as e:
+                    log.warning(f"Failed to migrate settings from {legacy_path} to {path}: {e}")
 
 
 settings = Settings()
